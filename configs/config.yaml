@@ -1,0 +1,68 @@
+# Physics-aware fPCA + DDPM pipeline for aircraft landing trajectories.
+# Everything the pipeline needs is here; no paths are hardcoded in the source.
+
+seed: 42
+device: auto            # auto -> mps > cuda > cpu
+
+paths:
+  # Source data: a `traffic` library Traffic object (pickle), 14k Zurich landings,
+  # each already exactly 200 timesteps up to the Final Approach Fix (…tilFAF).
+  raw_pkl: /Users/meldor/Desktop/git/deep-traffic-generation-paper/data/traffic_noga_tilFAF_train.pkl
+  processed: data/processed.npz          # Stage-1 cache (arrays + FAF anchors + meta)
+  checkpoint: checkpoints/pipeline.pt    # fPCA basis + scalers + DDPM weights + config
+  generated: results/generated.parquet
+  results_dir: results
+
+data:
+  # Feature channels the model operates on, in this order.
+  features: [track, groundspeed, altitude, timedelta]
+  # For the 'track' channel we read the unwrapped column so fPCA never sees the
+  # 0/360 discontinuity; reconstruction wraps it back with mod 360.
+  track_column: track_unwrapped
+  anchor_index: -1        # FAF anchor = last point of each flight (…tilFAF)
+  seq_len: 200
+  train_ratio: 0.9
+  resample: time          # 'time' = keep native 200-pt grid (guard only). 'arclength' also implemented.
+
+fpca:
+  explained_variance: 0.95   # per-feature retained-variance threshold
+  max_components: 40         # hard cap per feature (safety)
+
+ddpm:
+  timesteps: 1000
+  schedule: cosine           # cosine | linear
+  cosine_s: 0.008
+  beta_start: 1.0e-4         # linear schedule only
+  beta_end: 2.0e-2
+  sample_clamp: 10.0         # clamp latent each reverse step (~10 sigma; stabilizes sampling)
+
+denoiser:
+  hidden_dim: 256
+  n_blocks: 4
+  time_dim: 128
+  dropout: 0.0
+
+training:
+  epochs: 1200
+  batch_size: 256
+  lr: 2.0e-4
+  weight_decay: 0.0001
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 0
+  val_every: 25
+
+logging:
+  tensorboard_dir: runs     # `tensorboard --logdir runs` to view
+  log_every: 25             # training steps between scalar logs
+  enabled: true
+
+generate:
+  n_samples: 2000
+  physics_repair: true       # clip decoded features to data bounds, enforce monotone timedelta
+  physics_reject: true       # redraw latents whose decoded trajectory violates bounds
+  reject_max_tries: 5
+
+evaluate:
+  n_real: 2000
+  n_gen: 2000
