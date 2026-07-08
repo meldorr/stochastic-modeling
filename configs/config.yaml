@@ -25,10 +25,15 @@ data:
   resample: time          # 'time' = keep native 200-pt grid (guard only). 'arclength' also implemented.
 
 fpca:
+  basis: bspline             # bspline (Jarry: cubic spline + roughness penalty) | discrete
   explained_variance:
-    default: 0.999
-    track: 0.9999
+    default: 0.95
+    track: 0.95
   max_components: 200         # hard cap per feature (safety)
+  bspline:
+    n_basis: 40              # cubic B-spline coefficients per curve (caps reconstruction detail)
+    degree: 3               # cubic
+    smoothing: 1.0e-3       # Sobolev W^2 roughness penalty weight (∫ f''^2)
 
 ddpm:
   timesteps: 1000
@@ -61,7 +66,7 @@ unet_denoiser:
   dropout: 0.0
 
 training:
-  epochs: 3000
+  epochs: 1200
   batch_size: 256
   lr: 5.0e-4          # peak LR (reached after warmup)
   lr_init: 1.0e-5     # warmup starting LR

@@ -56,6 +56,8 @@ def fit_fpca(data: dict, cfg: dict, writer=None) -> FPCA:
         data["feature_names"],
         explained_variance=fcfg["explained_variance"],
         max_components=int(fcfg["max_components"]),
+        basis=fcfg.get("basis", "discrete"),
+        bspline_cfg=fcfg.get("bspline"),
     )
     ev = fpca.total_explained_variance()
     rmse = fpca.reconstruction_error(data["X_std"][data["val_idx"]])
