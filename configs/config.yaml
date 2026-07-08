@@ -25,8 +25,10 @@ data:
   resample: time          # 'time' = keep native 200-pt grid (guard only). 'arclength' also implemented.
 
 fpca:
-  explained_variance: 0.95   # per-feature retained-variance threshold
-  max_components: 40         # hard cap per feature (safety)
+  explained_variance:
+    default: 0.999
+    track: 0.9999
+  max_components: 200         # hard cap per feature (safety)
 
 ddpm:
   timesteps: 1000
@@ -42,10 +44,29 @@ denoiser:
   time_dim: 128
   dropout: 0.0
 
+tcn_denoiser:
+  channels: 64
+  n_blocks: 8
+  kernel_size: 3
+  dilations: [1, 2, 4, 8]
+  time_dim: 128
+  dropout: 0.0
+
+unet_denoiser:
+  hidden_dim: 256
+  depth: 3
+  channel_mult: [1, 2, 4]
+  blocks_per_level: 2
+  time_dim: 128
+  dropout: 0.0
+
 training:
-  epochs: 1200
+  epochs: 3000
   batch_size: 256
-  lr: 2.0e-4
+  lr: 5.0e-4          # peak LR (reached after warmup)
+  lr_init: 1.0e-5     # warmup starting LR
+  lr_min: 1.0e-6      # final LR after cosine decay
+  warmup_epochs: 100
   weight_decay: 0.0001
   ema_decay: 0.999
   grad_clip: 1.0

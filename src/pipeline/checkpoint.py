@@ -13,15 +13,23 @@ import numpy as np
 import torch
 
 from src.data.dataset import FeatureScaler
-from src.ddpm import LatentDDPM, MLPDenoiser
+from src.ddpm import LatentDDPM, MLPDenoiser, TCNDenoiser, UNetMLPDenoiser
 from src.fpca import FPCA
 from src.fpca.fpca import LatentScaler
 from src.pipeline.utils import ensure_parent, get_device
 
 
-def save_checkpoint(path, *, config, fpca: FPCA, feature_scaler: FeatureScaler,
-                    latent_scaler: LatentScaler, bounds: np.ndarray,
-                    denoiser_cfg: dict, model_state: dict) -> Path:
+def save_checkpoint(
+    path,
+    *,
+    config,
+    fpca: FPCA,
+    feature_scaler: FeatureScaler,
+    latent_scaler: LatentScaler,
+    bounds: np.ndarray,
+    denoiser_cfg: dict,
+    model_state: dict,
+) -> Path:
     out = ensure_parent(path)
     torch.save(
         {
@@ -48,7 +56,13 @@ def load_checkpoint(path, device=None) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
     fpca = FPCA.from_state(ckpt["fpca"])
-    denoiser = MLPDenoiser(**ckpt["denoiser_cfg"])
+    dcfg = ckpt["denoiser_cfg"]
+    if "channels" in dcfg:
+        denoiser = TCNDenoiser(**dcfg)
+    elif "depth" in dcfg:
+        denoiser = UNetMLPDenoiser(**dcfg)
+    else:
+        denoiser = MLPDenoiser(**dcfg)
     ddpm = LatentDDPM(denoiser, ckpt["ddpm_cfg"]).to(device)
     ddpm.load_state_dict(ckpt["model_state"])
     ddpm.eval()

@@ -20,7 +20,7 @@ import numpy as np
 
 def _fit_one(profiles: np.ndarray, threshold: float, cap: int) -> dict:
     """Discrete fPCA for one feature. ``profiles``: (N, T) standardized curves."""
-    mu = profiles.mean(0)                      # mean function (T,)
+    mu = profiles.mean(0)  # mean function (T,)
     centered = profiles - mu
     # economy SVD: Vt rows are orthonormal eigenfunctions, ordered by eigenvalue.
     _, s, vt = np.linalg.svd(centered, full_matrices=False)
@@ -31,9 +31,9 @@ def _fit_one(profiles: np.ndarray, threshold: float, cap: int) -> dict:
     k = max(1, min(k, cap, vt.shape[0]))
     return {
         "mean": mu.astype(np.float64),
-        "components": vt[:k].astype(np.float64),        # (k, T)
-        "evr": evr[:k].astype(np.float64),              # retained per-comp variance frac
-        "evr_full": evr.astype(np.float64),             # full spectrum (for diagnostics)
+        "components": vt[:k].astype(np.float64),  # (k, T)
+        "evr": evr[:k].astype(np.float64),  # retained per-comp variance frac
+        "evr_full": evr.astype(np.float64),  # full spectrum (for diagnostics)
         "k": k,
     }
 
@@ -46,7 +46,7 @@ class FPCA:
         self.bases = bases
         self.ks = [b["k"] for b in bases]
         self.slices = self._make_slices(self.ks)
-        self.m = sum(self.ks)                            # total latent dim
+        self.m = sum(self.ks)  # total latent dim
 
     @staticmethod
     def _make_slices(ks: list[int]) -> list[slice]:
@@ -61,13 +61,23 @@ class FPCA:
         cls,
         X_std: np.ndarray,
         feature_names: list[str],
-        explained_variance: float = 0.95,
+        explained_variance: float | dict = 0.95,
         max_components: int = 40,
     ) -> "FPCA":
-        """Fit one basis per feature on standardized profiles ``X_std`` (N, T, F)."""
+        """Fit one basis per feature on standardized profiles ``X_std`` (N, T, F).
+
+        ``explained_variance`` can be a scalar (applied to all features) or a
+        dict mapping feature name to threshold (missing features fall back to the
+        global default or 0.95).
+        """
         assert X_std.shape[-1] == len(feature_names)
+        if isinstance(explained_variance, dict):
+            default_ev = explained_variance.get("default", 0.95)
+            thresholds = [explained_variance.get(n, default_ev) for n in feature_names]
+        else:
+            thresholds = [float(explained_variance)] * len(feature_names)
         bases = [
-            _fit_one(X_std[:, :, f], explained_variance, max_components)
+            _fit_one(X_std[:, :, f], thresholds[f], max_components)
             for f in range(len(feature_names))
         ]
         return cls(feature_names, bases)
@@ -80,7 +90,7 @@ class FPCA:
         with np.errstate(all="ignore"):
             for f, b in enumerate(self.bases):
                 centered = X_std[:, :, f] - b["mean"]
-                parts.append(centered @ b["components"].T)   # (N, k_f)
+                parts.append(centered @ b["components"].T)  # (N, k_f)
         return np.concatenate(parts, axis=1).astype(np.float32)
 
     def decode(self, W: np.ndarray) -> np.ndarray:
@@ -96,10 +106,12 @@ class FPCA:
     def reconstruction_error(self, X_std: np.ndarray) -> np.ndarray:
         """Per-feature RMSE of encode->decode round trip (standardized units)."""
         rec = self.decode(self.encode(X_std))
-        return np.sqrt(((rec - X_std) ** 2).mean(axis=(0, 1)))       # (F,)
+        return np.sqrt(((rec - X_std) ** 2).mean(axis=(0, 1)))  # (F,)
 
     def total_explained_variance(self) -> dict[str, float]:
-        return {n: float(b["evr"].sum()) for n, b in zip(self.feature_names, self.bases)}
+        return {
+            n: float(b["evr"].sum()) for n, b in zip(self.feature_names, self.bases)
+        }
 
     # --- serialization -----------------------------------------------------
     def state(self) -> dict:
