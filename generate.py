@@ -12,9 +12,12 @@ import argparse
 
 import numpy as np
 
-from src.data.dataset import load_dataset
 from src.pipeline.checkpoint import load_checkpoint
-from src.pipeline.reconstruct import physics_repair, reconstruct_to_frame, within_bounds
+from src.pipeline.reconstruct import (
+    physics_repair,
+    reconstruct_to_frame_direct,
+    within_bounds,
+)
 from src.pipeline.utils import ensure_parent, load_config, resolve, set_seed
 
 
@@ -66,24 +69,41 @@ def sample_trajectories(bundle, n, reject, max_tries, clamp):
     return W, feats
 
 
-def assign_anchors(gen_feats, data, feature_names, seed, k_near=20):
-    """Match each generated trajectory to a real FAF anchor by nearest approach
-    heading (circular), sampling among the k nearest for spatial variety."""
-    rng = np.random.default_rng(seed)
-    ti = feature_names.index("track")
-    real_track = np.mod(data["X"][:, -1, ti], 360.0)  # (Nr,) real FAF heading
-    real_anchor = data["anchor_last"]  # (Nr, 2)
-    gen_track = np.mod(gen_feats[:, -1, ti], 360.0)  # (Ng,)
+def allocate_counts(weights: dict, clusters: list, n: int) -> dict:
+    """Largest-remainder allocation of n samples across clusters by weight."""
+    w = np.array([max(0.0, float(weights.get(c, 0.0))) for c in clusters])
+    if w.sum() == 0:
+        w = np.ones(len(clusters))
+    raw = w / w.sum() * n
+    base = np.floor(raw).astype(int)
+    order = np.argsort(-(raw - base))
+    for i in range(int(n - base.sum())):
+        base[order[i % len(base)]] += 1
+    return {c: int(base[i]) for i, c in enumerate(clusters)}
 
-    out = np.empty((len(gen_feats), 2), np.float64)
-    for start in range(0, len(gen_track), 512):  # chunk to bound memory
-        chunk = gen_track[start : start + 512]
-        diff = np.abs(chunk[:, None] - real_track[None, :])
-        circ = np.minimum(diff, 360.0 - diff)  # (chunk, Nr)
-        near = np.argpartition(circ, k_near, axis=1)[:, :k_near]
-        pick = near[np.arange(len(chunk)), rng.integers(0, k_near, len(chunk))]
-        out[start : start + 512] = real_anchor[pick]
-    return out
+
+def generate_per_cluster(bundle, cfg, n, clamp, reject, max_tries):
+    """Sample each cluster's DDPM in proportion to its (or a configured) frequency."""
+    clusters = bundle["clusters"]
+    mix = cfg["generate"].get("cluster_mix")
+    weights = {int(k): float(v) for k, v in (mix or bundle["frequencies"]).items()}
+    counts = allocate_counts(weights, clusters, n)
+    feats_all, ids_all = [], []
+    for c in clusters:
+        if counts[c] <= 0:
+            continue
+        mdl = bundle["models"][c]
+        sub = {
+            "ddpm": mdl["ddpm"], "m": mdl["m"], "latent_scaler": mdl["latent_scaler"],
+            "fpca": mdl["fpca"], "feature_scaler": bundle["feature_scaler"],
+            "bounds": bundle["bounds"], "feature_names": bundle["feature_names"],
+            "device": bundle["device"],
+        }
+        _, feats_c = sample_trajectories(sub, counts[c], reject, max_tries, clamp)
+        feats_all.append(feats_c)
+        ids_all.append(np.full(len(feats_c), c, np.int32))
+        print(f"[generate] cluster {c}: {len(feats_c)} trajectories (m={mdl['m']})")
+    return np.concatenate(feats_all), np.concatenate(ids_all)
 
 
 def main() -> None:
@@ -94,6 +114,10 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument(
         "--checkpoint", default=None, help="override paths.checkpoint in config"
+    )
+    ap.add_argument(
+        "--no-reject", action="store_true",
+        help="skip physics rejection sampling (much faster with under-trained models)",
     )
     args = ap.parse_args()
 
@@ -108,29 +132,31 @@ def main() -> None:
         else resolve(cfg["paths"]["checkpoint"])
     )
     bundle = load_checkpoint(ckpt_path)
-    data = load_dataset(cfg)
     names = bundle["feature_names"]
-
-    print(f"[generate] sampling {n} latents (m={bundle['m']}) …")
     clamp = cfg["ddpm"].get("sample_clamp")
-    W, feats = sample_trajectories(
-        bundle, n, bool(gcfg["physics_reject"]), int(gcfg["reject_max_tries"]), clamp
-    )
-    anchors = assign_anchors(feats, data, names, int(cfg["seed"]))
+    reject = (not args.no_reject) and bool(gcfg["physics_reject"])
+    max_tries = int(gcfg["reject_max_tries"])
 
-    df = reconstruct_to_frame(feats, anchors, names, flight_prefix="GEN")
+    # position is modelled directly (x, y) -> no dead-reckoning, no anchors.
+    if bundle["mode"] == "per_cluster":
+        print(f"[generate] per-cluster sampling {n} trajectories over "
+              f"{len(bundle['clusters'])} clusters …")
+        feats, cluster_ids = generate_per_cluster(bundle, cfg, n, clamp, reject, max_tries)
+        df = reconstruct_to_frame_direct(feats, names, flight_prefix="GEN",
+                                         extra={"cluster": cluster_ids})
+        npz_extra = {"cluster_ids": cluster_ids.astype(np.int32)}
+    else:
+        print(f"[generate] sampling {n} latents (m={bundle['m']}) …")
+        W, feats = sample_trajectories(bundle, n, reject, max_tries, clamp)
+        df = reconstruct_to_frame_direct(feats, names, flight_prefix="GEN")
+        npz_extra = {"W": W.astype(np.float32)}
 
     pq = ensure_parent(cfg["paths"]["generated"])
     df.to_parquet(pq, index=False)
     npz = pq.with_suffix(".npz")
-    np.savez_compressed(
-        npz,
-        feats=feats.astype(np.float32),
-        W=W.astype(np.float32),
-        anchors=anchors.astype(np.float32),
-        feature_names=np.array(names, dtype=object),
-    )
-    print(f"[generate] wrote {pq}  ({len(df)} rows, {n} trajectories)")
+    np.savez_compressed(npz, feats=feats.astype(np.float32),
+                        feature_names=np.array(names, dtype=object), **npz_extra)
+    print(f"[generate] wrote {pq}  ({len(df)} rows, {len(feats)} trajectories)")
     print(f"[generate] wrote {npz}")
 
 

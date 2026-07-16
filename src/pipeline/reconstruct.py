@@ -1,11 +1,11 @@
-"""Decoded feature profiles -> lat/lon tracks -> tidy DataFrame / parquet.
+"""Decoded feature profiles -> tidy DataFrame / parquet, two reconstruction paths.
 
-Mirrors `deep-traffic-generation-paper/dtg/traffic_builder.py`: because the data
-runs *up to* the FAF, the anchor is each trajectory's last point and we integrate
-(track, groundspeed, dt) backwards from it. Vectorized over the batch (one numpy
-op per timestep) so reconstructing thousands of tracks is fast, and with no
-`traffic`/`pitot` dependency (falls back to a spherical-earth step if `pitot`
-is unavailable).
+* ``reconstruct_to_frame_direct`` — position is modelled explicitly (e.g. ``x``/``y``),
+  so each feature is written as-is. No dead-reckoning. This is the default path.
+* ``reconstruct_to_frame`` + ``walk_latlon_backward`` — dead-reckoning for the
+  (track, groundspeed, timedelta) parametrization: integrate backwards from the
+  FAF anchor (the last point, since the data runs *up to* the FAF), mirroring
+  `deep-traffic-generation-paper/dtg/traffic_builder.py`. Kept for that feature set.
 
 Also hosts the data-driven physics layer (bounds clip + monotone timedelta),
 the lightweight analogue of the OpenAP envelope in `diffusion-models-lab`.
@@ -67,43 +67,42 @@ def _feat_idx(feature_names: list[str]) -> dict[str, int]:
 
 
 def physics_repair(feats: np.ndarray, bounds: np.ndarray, feature_names: list[str]) -> np.ndarray:
-    """Enforce physical plausibility on decoded profiles ``(N, T, F)`` in raw units:
+    """Enforce physical plausibility on decoded profiles ``(N, T, F)`` in raw units.
 
-    * groundspeed / altitude clipped to the training envelope,
-    * timedelta shifted to start at 0 and forced monotonic non-decreasing,
-    * track wrapped to [0, 360).
+    Feature-aware and generic over the feature set:
+
+    * ``timedelta`` -> shifted to start at 0 and forced monotone non-decreasing,
+    * ``track``     -> wrapped to [0, 360),
+    * everything else (x, y, altitude, groundspeed, ...) -> clipped to the
+      training envelope ``bounds[j]``.
     """
     out = feats.copy()
-    idx = _feat_idx(feature_names)
-    for name in ("groundspeed", "altitude"):
-        if name in idx:
-            j = idx[name]
+    for name, j in _feat_idx(feature_names).items():
+        if name == "timedelta":
+            td = out[:, :, j] - out[:, :1, j]
+            out[:, :, j] = np.maximum.accumulate(td, axis=1)
+        elif name == "track":
+            out[:, :, j] = np.mod(out[:, :, j], 360.0)
+        else:
             out[:, :, j] = np.clip(out[:, :, j], bounds[j, 0], bounds[j, 1])
-    if "timedelta" in idx:
-        j = idx["timedelta"]
-        td = out[:, :, j]
-        td = td - td[:, :1]
-        out[:, :, j] = np.maximum.accumulate(td, axis=1)
-    if "track" in idx:
-        j = idx["track"]
-        out[:, :, j] = np.mod(out[:, :, j], 360.0)
     return out
 
 
 def within_bounds(
     feats: np.ndarray, bounds: np.ndarray, feature_names: list[str], margin: float = 0.05
 ) -> np.ndarray:
-    """Boolean mask ``(N,)``: does every timestep sit inside the (margined)
-    training envelope for groundspeed and altitude? Used for rejection sampling."""
+    """Boolean mask ``(N,)``: does every timestep sit inside the (margined) training
+    envelope? Checks all features except ``timedelta``/``track`` (which are repaired,
+    not bounded). Used for rejection sampling."""
     idx = _feat_idx(feature_names)
     ok = np.ones(feats.shape[0], bool)
-    for name in ("groundspeed", "altitude"):
-        if name in idx:
-            j = idx[name]
-            lo, hi = bounds[j, 0], bounds[j, 1]
-            pad = margin * (hi - lo)
-            col = feats[:, :, j]
-            ok &= (col >= lo - pad).all(1) & (col <= hi + pad).all(1)
+    for name, j in idx.items():
+        if name in ("timedelta", "track"):
+            continue
+        lo, hi = bounds[j, 0], bounds[j, 1]
+        pad = margin * (hi - lo)
+        col = feats[:, :, j]
+        ok &= (col >= lo - pad).all(1) & (col <= hi + pad).all(1)
     return ok
 
 
@@ -135,6 +134,34 @@ def reconstruct_to_frame(
         df["timestamp"] = base_ts + pd.to_timedelta(td[i], unit="s")
         fid = f"{flight_prefix}_{i:05d}"
         df["flight_id"] = fid
+        if extra:
+            for k, v in extra.items():
+                df[k] = v[i]
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def reconstruct_to_frame_direct(
+    feats: np.ndarray,
+    feature_names: list[str],
+    flight_prefix: str = "GEN",
+    base_ts: pd.Timestamp | None = None,
+    extra: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
+    """Tidy long DataFrame built directly from the modelled features — no
+    dead-reckoning. Use when position is modelled explicitly (e.g. ``x``/``y``):
+    each feature becomes a column as-is, plus a UTC ``timestamp`` derived from
+    ``timedelta`` if present."""
+    idx = _feat_idx(feature_names)
+    n = feats.shape[0]
+    if base_ts is None:
+        base_ts = pd.Timestamp("2019-01-01", tz="UTC")
+    frames = []
+    for i in range(n):
+        df = pd.DataFrame({name: feats[i, :, idx[name]] for name in feature_names})
+        if "timedelta" in idx:
+            df["timestamp"] = base_ts + pd.to_timedelta(feats[i, :, idx["timedelta"]], unit="s")
+        df["flight_id"] = f"{flight_prefix}_{i:05d}"
         if extra:
             for k, v in extra.items():
                 df[k] = v[i]

@@ -6,7 +6,7 @@ Produces in results/:
     fpca_explained_variance.png   retained variance per feature
     latent_distribution.png       real vs generated latents (2D PCA view + per-dim)
     feature_profiles.png          mean +/- std profiles, real vs generated
-    spatial_tracks.png            reconstructed lat/lon tracks, real vs generated
+    spatial_tracks.png            modelled x/y tracks, real vs generated
     metrics.json / metrics.txt    numbers (explained variance, recon RMSE, KS distances)
 """
 
@@ -25,7 +25,6 @@ from sklearn.decomposition import PCA
 
 from src.data.dataset import load_dataset
 from src.pipeline.checkpoint import load_checkpoint
-from src.pipeline.reconstruct import walk_latlon_backward
 from src.pipeline.utils import load_config, resolve
 
 REAL_C, GEN_C = "#1f77b4", "#d62728"
@@ -36,7 +35,7 @@ def _load_generated(cfg):
     if not npz.exists():
         raise FileNotFoundError(f"{npz} not found — run generate.py first.")
     g = np.load(npz, allow_pickle=True)
-    return g["feats"], g["W"], g["anchors"]
+    return g["feats"], g["W"]
 
 
 def plot_explained_variance(fpca, path):
@@ -163,29 +162,133 @@ def plot_fpca_reconstruction(
     plt.close(fig)
 
 
-def plot_spatial(real_ll, gen_ll, flows, path, n_show=400):
+def plot_spatial(real_xy, gen_xy, path, n_show=400):
+    """Plot modelled x/y tracks directly (no dead-reckoning). Inputs (N, T, 2)."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 5.4), sharex=True, sharey=True)
     ri = np.random.default_rng(0).choice(
-        len(real_ll), min(n_show, len(real_ll)), replace=False
+        len(real_xy), min(n_show, len(real_xy)), replace=False
     )
     gi = np.random.default_rng(1).choice(
-        len(gen_ll), min(n_show, len(gen_ll)), replace=False
+        len(gen_xy), min(n_show, len(gen_xy)), replace=False
     )
-    for ll in real_ll[ri]:
-        axes[0].plot(ll[:, 1], ll[:, 0], color=REAL_C, lw=0.4, alpha=0.3)
-    for ll in gen_ll[gi]:
-        axes[1].plot(ll[:, 1], ll[:, 0], color=GEN_C, lw=0.4, alpha=0.3)
+    for xy in real_xy[ri]:
+        axes[0].plot(xy[:, 0], xy[:, 1], color=REAL_C, lw=0.4, alpha=0.3)
+    for xy in gen_xy[gi]:
+        axes[1].plot(xy[:, 0], xy[:, 1], color=GEN_C, lw=0.4, alpha=0.3)
     axes[0].set_title(f"Real ({len(ri)})")
     axes[1].set_title(f"Generated ({len(gi)})")
     for ax in axes:
-        ax.set_xlabel("longitude")
+        ax.set_xlabel("x (m)")
         ax.grid(alpha=0.3)
         ax.set_aspect("equal", "box")
-    axes[0].set_ylabel("latitude")
-    fig.suptitle("Spatial tracks (reconstructed from track/groundspeed/timedelta)")
+    axes[0].set_ylabel("y (m)")
+    fig.suptitle("Spatial tracks (modelled x/y directly — no dead-reckoning)")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
+
+
+def plot_spatial_by_cluster(real_xy, real_lab, gen_xy, gen_lab, clusters, path, n_show=600):
+    """Real vs generated x/y tracks, coloured by cluster."""
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.6), sharex=True, sharey=True)
+    for panel, (xy, lab, title) in enumerate(
+        [(real_xy, real_lab, "Real"), (gen_xy, gen_lab, "Generated")]
+    ):
+        rng = np.random.default_rng(panel)
+        idx = rng.choice(len(xy), min(n_show, len(xy)), replace=False)
+        for c in clusters:
+            for s in idx[lab[idx] == c]:
+                axes[panel].plot(xy[s, :, 0], xy[s, :, 1], color=cmap(c % 10), lw=0.4, alpha=0.35)
+            axes[panel].plot([], [], color=cmap(c % 10), label=f"c{c}")
+        axes[panel].set_title(f"{title} ({len(idx)})")
+        axes[panel].set_aspect("equal", "box")
+        axes[panel].grid(alpha=0.3)
+        axes[panel].set_xlabel("x (m)")
+    axes[0].set_ylabel("y (m)")
+    axes[0].legend(fontsize=7)
+    fig.suptitle("Per-cluster generation: real vs generated, coloured by cluster")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def plot_per_cluster_rmse(per, names, clusters, path):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    x = np.arange(len(names))
+    w = 0.8 / max(len(clusters), 1)
+    for i, c in enumerate(clusters):
+        ax.bar(x + (i - len(clusters) / 2) * w + w / 2, per[c]["rmse"], w,
+               label=f"c{c}", color=plt.get_cmap("tab10")(c % 10))
+    ax.set_xticks(x)
+    ax.set_xticklabels(names)
+    ax.set_ylabel("val recon RMSE (std)")
+    ax.set_title("Per-cluster fPCA reconstruction RMSE")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def evaluate_per_cluster(cfg, bundle, data, names, out_dir):
+    labels = bundle["labels"]
+    models, clusters = bundle["models"], bundle["clusters"]
+    fsc = bundle["feature_scaler"]
+    Xs, Xr, va = data["X_std"], data["X"], data["val_idx"]
+    xi, yi = names.index("x"), names.index("y")
+
+    g = np.load(resolve(cfg["paths"]["generated"]).with_suffix(".npz"), allow_pickle=True)
+    gen_feats, gen_cl = g["feats"], g["cluster_ids"]
+
+    plot_spatial_by_cluster(
+        Xr[:, :, [xi, yi]], labels, gen_feats[:, :, [xi, yi]], gen_cl, clusters,
+        out_dir / "cluster_generated_spatial.png",
+    )
+    rng = np.random.default_rng(int(cfg["seed"]))
+    ridx = rng.choice(len(Xr), min(int(cfg["evaluate"]["n_real"]), len(Xr)), replace=False)
+    plot_profiles(Xr[ridx], gen_feats, names, out_dir / "feature_profiles.png")
+
+    per = {}
+    for c in clusters:
+        fpca_c, ls_c = models[c]["fpca"], models[c]["latent_scaler"]
+        va_c = va[labels[va] == c]
+        rmse = fpca_c.reconstruction_error(Xs[va_c])
+        real_W = ls_c.transform(fpca_c.encode(Xs[va_c]))
+        gc = gen_feats[gen_cl == c]
+        if len(gc) > 5:
+            gen_W = ls_c.transform(fpca_c.encode(fsc.transform(gc)))
+            ks = float(np.mean([ks_2samp(real_W[:, j], gen_W[:, j]).statistic for j in range(fpca_c.m)]))
+        else:
+            ks = float("nan")
+        per[c] = {"m": int(fpca_c.m), "n_val": int(len(va_c)), "n_gen": int(len(gc)),
+                  "rmse": rmse, "ks_latent_mean": ks}
+
+    plot_per_cluster_rmse(per, names, clusters, out_dir / "per_cluster_recon_rmse.png")
+
+    ks_feat = {nm: float(ks_2samp(Xr[ridx][:, :, j].ravel(), gen_feats[:, :, j].ravel()).statistic)
+               for j, nm in enumerate(names)}
+    metrics = {
+        "mode": "per_cluster",
+        "clusters": clusters,
+        "frequencies": bundle["frequencies"],
+        "per_cluster": {
+            int(c): {
+                "m": per[c]["m"], "n_val": per[c]["n_val"], "n_gen": per[c]["n_gen"],
+                "recon_rmse": {nm: round(float(r), 4) for nm, r in zip(names, per[c]["rmse"])},
+                "ks_latent_mean": round(per[c]["ks_latent_mean"], 4),
+            } for c in clusters
+        },
+        "ks_feature_marginal": {k: round(v, 4) for k, v in ks_feat.items()},
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    print("=== per-cluster evaluation ===")
+    for c in clusters:
+        p = metrics["per_cluster"][c]
+        print(f"  cluster {c}: m={p['m']:2d}  recon={p['recon_rmse']}  "
+              f"ks_latent={p['ks_latent_mean']}  (n_gen={p['n_gen']})")
+    print(f"  KS feature marginals: {metrics['ks_feature_marginal']}")
+    print(f"[evaluate] per-cluster plots + metrics -> {out_dir}")
 
 
 def main() -> None:
@@ -199,9 +302,14 @@ def main() -> None:
 
     bundle = load_checkpoint(resolve(cfg["paths"]["checkpoint"]))
     data = load_dataset(cfg)
-    fpca, names = bundle["fpca"], bundle["feature_names"]
+    names = bundle["feature_names"]
 
-    gen_feats, gen_W_raw, gen_anchors = _load_generated(cfg)
+    if bundle["mode"] == "per_cluster":
+        evaluate_per_cluster(cfg, bundle, data, names, out_dir)
+        return
+
+    fpca = bundle["fpca"]
+    gen_feats, gen_W_raw = _load_generated(cfg)
 
     # subsample real for a balanced comparison
     rng = np.random.default_rng(int(cfg["seed"]))
@@ -210,22 +318,10 @@ def main() -> None:
     )
     real_X = data["X"][ridx]
     real_X_std = data["X_std"][ridx]
-    real_ll = data["latlon"][ridx]
 
     # latent spaces (normalized, the space the DDPM lives in)
     real_W_n = bundle["latent_scaler"].transform(fpca.encode(real_X_std))
     gen_W_n = bundle["latent_scaler"].transform(gen_W_raw)
-
-    # reconstruct generated spatial tracks
-    ti, gi, tdi = (
-        names.index("track"),
-        names.index("groundspeed"),
-        names.index("timedelta"),
-    )
-    glat, glon = walk_latlon_backward(
-        gen_feats[:, :, ti], gen_feats[:, :, gi], gen_feats[:, :, tdi], gen_anchors
-    )
-    gen_ll = np.stack([glat, glon], axis=-1)
 
     # ---- plots ----
     plot_explained_variance(fpca, out_dir / "fpca_explained_variance.png")
@@ -238,7 +334,13 @@ def main() -> None:
     )
     plot_latent(real_W_n, gen_W_n, out_dir / "latent_distribution.png")
     plot_profiles(real_X, gen_feats, names, out_dir / "feature_profiles.png")
-    plot_spatial(real_ll, gen_ll, data["flow"][ridx], out_dir / "spatial_tracks.png")
+    # spatial: x/y are modelled directly, so no reconstruction is needed
+    if "x" in names and "y" in names:
+        xi, yi = names.index("x"), names.index("y")
+        plot_spatial(
+            real_X[:, :, [xi, yi]], gen_feats[:, :, [xi, yi]],
+            out_dir / "spatial_tracks.png",
+        )
 
     # ---- metrics ----
     recon_rmse = fpca.reconstruction_error(data["X_std"][data["val_idx"]])

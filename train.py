@@ -25,9 +25,10 @@ from src.data.dataset import load_dataset
 from src.data.prepare import prepare
 from src.ddpm import LatentDDPM, MLPDenoiser, TCNDenoiser, UNetMLPDenoiser
 from src.ddpm.ddpm import EMA
+from src.cluster.assigner import ClusterAssigner
 from src.fpca import FPCA
 from src.fpca.fpca import LatentScaler
-from src.pipeline.checkpoint import save_checkpoint
+from src.pipeline.checkpoint import save_checkpoint, save_per_cluster_checkpoint
 from src.pipeline.utils import get_device, load_config, resolve, set_seed
 
 
@@ -83,8 +84,9 @@ def fit_fpca(data: dict, cfg: dict, writer=None) -> FPCA:
     return fpca
 
 
-def train_ddpm(W_tr, W_val, m, cfg, device, writer=None, denoiser_type="mlp"):
+def train_ddpm(W_tr, W_val, m, cfg, device, writer=None, denoiser_type="mlp", prefix=""):
     tcfg = cfg["training"]
+    tag = lambda s: f"{prefix}{s}"  # noqa: E731  (TensorBoard scalar namespacing)
     if denoiser_type == "tcn":
         dcfg = cfg["tcn_denoiser"]
         denoiser_cfg = {
@@ -121,7 +123,8 @@ def train_ddpm(W_tr, W_val, m, cfg, device, writer=None, denoiser_type="mlp"):
         ddpm = LatentDDPM(MLPDenoiser(**denoiser_cfg), cfg["ddpm"]).to(device)
     n_params = sum(p.numel() for p in ddpm.parameters())
     print(
-        f"[ddpm] latent m={m}, denoiser={denoiser_type}, params={n_params / 1e3:.1f}k, device={device}"
+        f"[ddpm] {prefix}latent m={m}, denoiser={denoiser_type}, "
+        f"params={n_params / 1e3:.1f}k, device={device}"
     )
 
     opt = torch.optim.AdamW(
@@ -179,19 +182,19 @@ def train_ddpm(W_tr, W_val, m, cfg, device, writer=None, denoiser_type="mlp"):
             running += loss.item() * wb.size(0)
             step += 1
             if writer and step % log_every == 0:
-                writer.add_scalar("train/loss_step", loss.item(), step)
+                writer.add_scalar(tag("train/loss_step"), loss.item(), step)
         train_loss = running / len(loader.dataset)
         if writer:
-            writer.add_scalar("train/loss_epoch", train_loss, ep)
-            writer.add_scalar("train/lr", opt.param_groups[0]["lr"], ep)
+            writer.add_scalar(tag("train/loss_epoch"), train_loss, ep)
+            writer.add_scalar(tag("train/lr"), opt.param_groups[0]["lr"], ep)
         if ep % val_every == 0 or ep == 1 or ep == epochs:
             ddpm.eval()
             with torch.no_grad():
                 vloss = torch.stack([ddpm(W_val_t) for _ in range(8)]).mean().item()
             if writer:
-                writer.add_scalar("val/loss", vloss, ep)
+                writer.add_scalar(tag("val/loss"), vloss, ep)
             print(
-                f"[ddpm] epoch {ep:4d}/{epochs}  train {train_loss:.4f}  val {vloss:.4f}"
+                f"[ddpm] {prefix}epoch {ep:4d}/{epochs}  train {train_loss:.4f}  val {vloss:.4f}"
                 f"  ({time.time() - t0:.0f}s)"
             )
         scheduler.step()
@@ -207,9 +210,52 @@ def train_ddpm(W_tr, W_val, m, cfg, device, writer=None, denoiser_type="mlp"):
                 .numpy()
             )
         for j in range(min(m, 8)):
-            writer.add_histogram(f"latent/real/dim_{j}", W_tr[:, j], 0)
-            writer.add_histogram(f"latent/gen/dim_{j}", samp[:, j], 0)
+            writer.add_histogram(tag(f"latent/real/dim_{j}"), W_tr[:, j], 0)
+            writer.add_histogram(tag(f"latent/gen/dim_{j}"), samp[:, j], 0)
     return ddpm, ema, denoiser_cfg
+
+
+def train_per_cluster(data, cfg, device, writer, denoiser_type):
+    """Cluster flights, then fit an independent fPCA + DDPM per cluster."""
+    names = list(data["feature_names"])
+    Xs, tr, va = data["X_std"], data["train_idx"], data["val_idx"]
+    fcfg = cfg["fpca"]
+
+    assigner, labels = ClusterAssigner.fit(data, cfg["cluster"], int(cfg["seed"]))
+    clusters = sorted(set(int(c) for c in labels))
+    freqs = {c: float((labels == c).mean()) for c in clusters}
+    sizes = {c: int((labels == c).sum()) for c in clusters}
+    print(f"[cluster] k={len(clusters)} sizes={sizes} "
+          f"freqs={{{', '.join(f'{c}:{freqs[c]:.2f}' for c in clusters)}}}")
+
+    models = {}
+    for c in clusters:
+        tr_c, va_c = tr[labels[tr] == c], va[labels[va] == c]
+        fpca_c = FPCA.fit(
+            Xs[tr_c], names, explained_variance=fcfg["explained_variance"],
+            max_components=int(fcfg["max_components"]),
+            basis=fcfg.get("basis", "discrete"), bspline_cfg=fcfg.get("bspline"),
+        )
+        rmse = fpca_c.reconstruction_error(Xs[va_c])
+        Wtr_raw, Wva_raw = fpca_c.encode(Xs[tr_c]), fpca_c.encode(Xs[va_c])
+        ls = LatentScaler.fit(Wtr_raw)
+        print(f"[cluster {c}] n_train={len(tr_c)} m={fpca_c.m} "
+              f"valRMSE={dict(zip(names, np.round(rmse, 4)))}")
+        if writer:
+            writer.add_scalar(f"cluster_{c}/fpca/m", fpca_c.m, 0)
+        _, ema, dcfg = train_ddpm(
+            ls.transform(Wtr_raw), ls.transform(Wva_raw), fpca_c.m, cfg, device,
+            writer, denoiser_type, prefix=f"cluster_{c}/",
+        )
+        models[c] = {"fpca_state": fpca_c.state(), "latent_scaler_state": ls.state(),
+                     "denoiser_cfg": dcfg, "m": fpca_c.m, "model_state": ema.state_dict()}
+
+    out = save_per_cluster_checkpoint(
+        cfg["paths"]["checkpoint"], config=cfg, feature_names=names,
+        feature_scaler=data["scaler"], bounds=data["bounds"], assigner=assigner,
+        labels=labels, flight_ids=data["flight_ids"], frequencies=freqs, models=models,
+    )
+    print(f"[done] per-cluster checkpoint ({len(clusters)} clusters) -> {out}")
 
 
 def main() -> None:
@@ -246,33 +292,29 @@ def main() -> None:
         f"{len(data['train_idx'])}/{len(data['val_idx'])} train/val"
     )
 
-    fpca = fit_fpca(data, cfg, writer)
-
-    W_all = fpca.encode(data["X_std"])
-    latent_scaler = LatentScaler.fit(W_all[data["train_idx"]])
-    W_tr = latent_scaler.transform(W_all[data["train_idx"]])
-    W_val = latent_scaler.transform(W_all[data["val_idx"]])
-
     if writer:
         writer.add_text("config", "```json\n" + json.dumps(cfg, indent=2) + "\n```", 0)
 
-    ddpm, ema, denoiser_cfg = train_ddpm(
-        W_tr, W_val, fpca.m, cfg, device, writer, args.denoiser
-    )
+    if cfg.get("cluster", {}).get("enabled", False):
+        train_per_cluster(data, cfg, device, writer, args.denoiser)
+    else:
+        fpca = fit_fpca(data, cfg, writer)
+        W_all = fpca.encode(data["X_std"])
+        latent_scaler = LatentScaler.fit(W_all[data["train_idx"]])
+        W_tr = latent_scaler.transform(W_all[data["train_idx"]])
+        W_val = latent_scaler.transform(W_all[data["val_idx"]])
+        ddpm, ema, denoiser_cfg = train_ddpm(
+            W_tr, W_val, fpca.m, cfg, device, writer, args.denoiser
+        )
+        out = save_checkpoint(
+            cfg["paths"]["checkpoint"], config=cfg, fpca=fpca,
+            feature_scaler=data["scaler"], latent_scaler=latent_scaler,
+            bounds=data["bounds"], denoiser_cfg=denoiser_cfg, model_state=ema.state_dict(),
+        )
+        print(f"[done] checkpoint -> {out}")
 
-    out = save_checkpoint(
-        cfg["paths"]["checkpoint"],
-        config=cfg,
-        fpca=fpca,
-        feature_scaler=data["scaler"],
-        latent_scaler=latent_scaler,
-        bounds=data["bounds"],
-        denoiser_cfg=denoiser_cfg,
-        model_state=ema.state_dict(),
-    )
     if writer:
         writer.close()
-    print(f"[done] checkpoint -> {out}")
 
 
 if __name__ == "__main__":

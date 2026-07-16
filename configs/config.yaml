@@ -15,9 +15,9 @@ paths:
 
 data:
   # Feature channels the model operates on, in this order.
-  features: [track, groundspeed, altitude, timedelta]
-  # For the 'track' channel we read the unwrapped column so fPCA never sees the
-  # 0/360 discontinuity; reconstruction wraps it back with mod 360.
+  # x, y are projected position (UTM metres) -> reconstruction is identity, no dead-reckoning.
+  features: [x, y, altitude, timedelta]
+  # Only used if 'track' is among features (unwrapped avoids the 0/360 jump).
   track_column: track_unwrapped
   anchor_index: -1        # FAF anchor = last point of each flight (…tilFAF)
   seq_len: 200
@@ -25,10 +25,10 @@ data:
   resample: time          # 'time' = keep native 200-pt grid (guard only). 'arclength' also implemented.
 
 fpca:
-  basis: bspline             # bspline (Jarry: cubic spline + roughness penalty) | discrete
+  basis: discrete            # bspline (Jarry: cubic spline + roughness penalty) | discrete
   explained_variance:
-    default: 0.95
-    track: 0.95
+    default: 0.99
+    track: 0.99
   max_components: 200         # hard cap per feature (safety)
   bspline:
     n_basis: 40              # cubic B-spline coefficients per curve (caps reconstruction detail)
@@ -88,7 +88,20 @@ generate:
   physics_repair: true       # clip decoded features to data bounds, enforce monotone timedelta
   physics_reject: true       # redraw latents whose decoded trajectory violates bounds
   reject_max_tries: 5
+  cluster_mix: null          # per-cluster mode: null = sample by real frequency; else {0: w0, 1: w1, ...}
 
 evaluate:
   n_real: 2000
   n_gen: 2000
+
+cluster:
+  enabled: true           # true -> train one fPCA+DDPM per cluster; false -> single global model
+  basis: xy_flat          # xy_fpca (fpca-then-cluster) | xy_flat (cluster raw x/y)
+  features: [x, y]        # channels to cluster on (x/y = spatial approach shape)
+  method: kmeans          # kmeans | gmm | hdbscan
+  k: 5                    # chosen cluster count (ARI peak ~ known flows; see cluster_ksweep.png)
+  k_sweep: [2, 3, 4, 5, 6, 7, 8]
+  stride: 4               # time subsampling for xy_flat
+  hdbscan_min: 200        # HDBSCAN min_cluster_size (reference run)
+  compare_bases: true     # also sweep xy_flat for the comparison table
+  labels_out: results/cluster_labels.npz
