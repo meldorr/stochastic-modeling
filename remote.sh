@@ -22,8 +22,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-REMOTE="${REMOTE:-sim@131.180.117.11}"
-REMOTE_DIR="${REMOTE_DIR:-\$HOME/stochastic-modeling}"
+REMOTE="${REMOTE:-sim@131.180.117.10}"
+REMOTE_DIR="${REMOTE_DIR:-/home/sim/Desktop/eldor/stochastic-modeling}"
+# raw pickle location ON THE REMOTE (only needed if processed.npz isn't pushed)
+REMOTE_RAW_PKL="${REMOTE_RAW_PKL:-/home/sim/Desktop/eldor/diffusion-models-lab/data/traffic_noga_tilFAF_train.pkl}"
 SSH="ssh -o ConnectTimeout=8 $REMOTE"
 
 cmd="${1:-status}"; shift || true
@@ -45,7 +47,7 @@ case "$cmd" in
     ;;
   launch)
     ARGS="$*"
-    $SSH "cd $REMOTE_DIR && mkdir -p results && PY=.venv/bin/python EPOCHS='${EPOCHS:-}' N_GEN='${N_GEN:-}' nohup bash run_experiments.sh $ARGS > results/nohup.out 2>&1 & echo \"launched pid \$!\""
+    $SSH "cd $REMOTE_DIR && mkdir -p results && STOCH_RAW_PKL='$REMOTE_RAW_PKL' PY=.venv/bin/python EPOCHS='${EPOCHS:-}' N_GEN='${N_GEN:-}' nohup bash run_experiments.sh $ARGS > results/nohup.out 2>&1 & echo \"launched pid \$!\""
     ;;
   status)
     $SSH "cd $REMOTE_DIR 2>/dev/null && { echo '--- last log ---'; tail -15 results/experiments_run.log 2>/dev/null || tail -15 results/nohup.out 2>/dev/null || echo 'no log yet'; echo '--- procs ---'; pgrep -af 'stages/s1|run_experiments' || echo 'nothing running'; echo '--- gpu ---'; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null; }"

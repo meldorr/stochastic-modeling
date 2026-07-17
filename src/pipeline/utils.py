@@ -59,6 +59,8 @@ def load_experiment_config(exp_path: str | Path, base_path: str | Path = "config
     data_dir = os.environ.get("STOCH_DATA_DIR", cfg["paths"]["data_dir"])
     cfg["paths"]["data_dir"] = data_dir
     cfg["paths"].setdefault("processed", str(Path(data_dir) / "processed.npz"))
+    # machine-specific raw pickle location without editing configs
+    cfg["paths"]["raw_pkl"] = os.environ.get("STOCH_RAW_PKL", cfg["paths"]["raw_pkl"])
     return cfg
 
 
