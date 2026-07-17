@@ -11,6 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export PYTHONPATH="$(pwd)"
+export PYTHONUNBUFFERED=1   # stream epoch lines to the log immediately (nohup otherwise block-buffers)
 
 PY="${PY:-python}"
 EPOCHS="${EPOCHS:-}"          # empty = use configs (base.yaml training.epochs)
