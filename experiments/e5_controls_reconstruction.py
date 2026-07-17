@@ -135,25 +135,35 @@ def main() -> None:
     fig.savefig(out / "error_growth.png", dpi=130)
     plt.close(fig)
 
-    # --- overlay figure: worst dead-reckon flights make the point ---
-    e_dr = np.hypot(*(routes["deadreckon gs/track (euler)"] - xy_true).transpose(2, 0, 1))
-    order = np.argsort(e_dr.mean(1))
-    pick = [order[len(order) // 2], order[-3], order[-2]]     # median + 2 bad cases
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2))
-    for ax, k in zip(axes, pick):
-        ax.plot(xy_true[k, :, 0], xy_true[k, :, 1], color="black", lw=2.2, label="real track")
-        ax.plot(*routes["deadreckon gs/track (euler)"][k].T, color="#1f77b4", lw=1.4,
-                label="dead-reckon gs/track")
-        ax.plot(*routes["derived controls (SavGol21+trapezoid)"][k].T, color="#d62728",
-                lw=1.4, ls="--", label="controls re-integration")
-        ax.scatter([xy_true[k, 0, 0]], [xy_true[k, 0, 1]], color="green", s=25, zorder=5)
-        ax.set_title(f"flight {k}: DR {e_dr[k].mean():.0f} m vs "
-                     f"controls {np.hypot(*(routes['derived controls (SavGol21+trapezoid)'][k]-xy_true[k]).T.reshape(2,-1)).mean():.0f} m mean",
-                     fontsize=9)
-        ax.set_aspect("equal", "datalim")
-        ax.grid(alpha=0.3)
-    axes[0].legend(fontsize=8)
-    fig.suptitle("E5: median + two worst dead-reckoning flights")
+    # --- overlay figure ---
+    # row 1: median + two worst DEAD-RECKONING flights
+    # row 2: the three worst CONTROLS-reconstruction flights (its own failure modes)
+    e_dr = np.hypot(*(routes["deadreckon gs/track (euler)"] - xy_true).transpose(2, 0, 1)).mean(1)
+    e_ct = np.hypot(*(routes["derived controls (SavGol21+trapezoid)"] - xy_true).transpose(2, 0, 1)).mean(1)
+    order_dr, order_ct = np.argsort(e_dr), np.argsort(e_ct)
+    rows = [
+        ("median + two worst dead-reckoning flights",
+         [order_dr[len(order_dr) // 2], order_dr[-2], order_dr[-1]]),
+        ("three worst controls-reconstruction flights",
+         [order_ct[-3], order_ct[-2], order_ct[-1]]),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10.5))
+    for r, (row_title, pick) in enumerate(rows):
+        for cidx, k in enumerate(pick):
+            ax = axes[r, cidx]
+            ax.plot(xy_true[k, :, 0], xy_true[k, :, 1], color="black", lw=2.2, label="real track")
+            ax.plot(*routes["deadreckon gs/track (euler)"][k].T, color="#1f77b4", lw=1.4,
+                    label="dead-reckon gs/track")
+            ax.plot(*routes["derived controls (SavGol21+trapezoid)"][k].T, color="#d62728",
+                    lw=1.4, ls="--", label="controls re-integration")
+            ax.scatter([xy_true[k, 0, 0]], [xy_true[k, 0, 1]], color="green", s=25, zorder=5)
+            ax.set_title(f"flight {k}: DR {e_dr[k]:.0f} m vs controls {e_ct[k]:.0f} m mean",
+                         fontsize=9)
+            ax.set_aspect("equal", "datalim")
+            ax.grid(alpha=0.3)
+        axes[r, 0].set_ylabel(row_title, fontsize=10)
+    axes[0, 0].legend(fontsize=8)
+    fig.suptitle("E5: overlay — top: worst for dead-reckoning; bottom: worst for controls")
     fig.tight_layout()
     fig.savefig(out / "overlay.png", dpi=130)
     plt.close(fig)
