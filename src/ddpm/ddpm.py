@@ -23,15 +23,16 @@ class LatentDDPM(nn.Module):
         for name, buf in build_schedule(ddpm_cfg).items():
             self.register_buffer(name, buf)
 
-    def _gather(self, buf: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return buf[t].view(-1, 1)
+    def _gather(self, buf: torch.Tensor, t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        # broadcast over (B, m) latents and (B, C, T) trajectories alike
+        return buf[t].view(-1, *([1] * (like.dim() - 1)))
 
     def q_sample(self, x0, t, noise=None):
         """Forward diffusion: x_t ~ q(x_t | x_0)."""
         if noise is None:
             noise = torch.randn_like(x0)
-        s1 = self._gather(self.sqrt_alphas_bar, t)
-        s2 = self._gather(self.sqrt_one_minus_alphas_bar, t)
+        s1 = self._gather(self.sqrt_alphas_bar, t, x0)
+        s2 = self._gather(self.sqrt_one_minus_alphas_bar, t, x0)
         return s1 * x0 + s2 * noise, noise
 
     def forward(self, x0: torch.Tensor) -> torch.Tensor:
@@ -44,9 +45,9 @@ class LatentDDPM(nn.Module):
     @torch.no_grad()
     def p_sample(self, x_t, t, deterministic: bool = False):
         """One reverse step x_t -> x_{t-1} (epsilon parameterization)."""
-        betas_t = self._gather(self.betas, t)
-        alphas_t = self._gather(self.alphas, t)
-        alphas_bar_t = self._gather(self.alphas_bar, t)
+        betas_t = self._gather(self.betas, t, x_t)
+        alphas_t = self._gather(self.alphas, t, x_t)
+        alphas_bar_t = self._gather(self.alphas_bar, t, x_t)
 
         eps = self.denoiser(x_t, t)
         mean = (1.0 / torch.sqrt(alphas_t + 1e-8)) * (
@@ -54,23 +55,25 @@ class LatentDDPM(nn.Module):
         )
         if deterministic:
             return mean
-        sigma = torch.sqrt(self._gather(self.posterior_variance, t))
+        sigma = torch.sqrt(self._gather(self.posterior_variance, t, x_t))
         noise = torch.randn_like(x_t)
-        nonzero = (t != 0).view(-1, 1).float()
+        nonzero = (t != 0).view(-1, *([1] * (x_t.dim() - 1))).float()
         return mean + nonzero * sigma * noise
 
     @torch.no_grad()
-    def sample(self, n: int, m: int, device=None, deterministic: bool = False,
-               clamp: float | None = None):
-        """Generate ``n`` latent vectors from pure noise.
+    def sample(self, n: int, m: int | None = None, device=None, deterministic: bool = False,
+               clamp: float | None = None, shape: tuple | None = None):
+        """Generate ``n`` samples from pure noise.
 
-        ``clamp`` bounds the running sample each reverse step (in normalized
-        latent units, so ~10 = 10 sigma). It never bites a well-trained model
-        but prevents an under-trained one from diverging to +/-1e4.
+        Latent mode: pass ``m`` -> samples are ``(n, m)``. Trajectory mode: pass
+        ``shape=(C, T)`` -> samples are ``(n, C, T)``. ``clamp`` bounds the running
+        sample each reverse step (in normalized units, so ~10 = 10 sigma); it never
+        bites a well-trained model but stops an under-trained one diverging.
         """
         if device is None:
             device = next(self.parameters()).device
-        x = torch.randn(n, m, device=device)
+        dims = tuple(shape) if shape is not None else (int(m),)
+        x = torch.randn(n, *dims, device=device)
         for ti in reversed(range(self.timesteps)):
             t = torch.full((n,), ti, device=device, dtype=torch.long)
             x = self.p_sample(x, t, deterministic=deterministic)

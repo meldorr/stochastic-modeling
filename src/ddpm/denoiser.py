@@ -301,3 +301,55 @@ class UNetMLPDenoiser(nn.Module):
                 h = blk(h, t_emb)
 
         return self.out_proj(F.silu(self.out_norm(h)))
+
+
+# ---------------------------------------------------------------------------
+# Trajectory-space TCN denoiser (raw-space diffusion, no fPCA)
+# ---------------------------------------------------------------------------
+
+
+class TrajTCNDenoiser(nn.Module):
+    """Dilated TCN denoiser over full trajectories ``(B, C, T)``.
+
+    For the E4 raw-space baseline: the DDPM diffuses the standardized trajectory
+    tensor directly (C feature channels x T timesteps), no fPCA latent. Reuses
+    :class:`TCNResBlock`; the dilation cycle gives a receptive field spanning the
+    200-step sequence.
+    """
+
+    def __init__(
+        self,
+        channels_in: int,
+        hidden: int = 64,
+        n_blocks: int = 10,
+        kernel_size: int = 5,
+        dilations: list | None = None,
+        time_dim: int = 128,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if dilations is None:
+            dilations = [1, 2, 4, 8, 16]
+        self.channels_in = channels_in
+        self.time_emb = SinusoidalTimeEmbedding(time_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_dim * 2, time_dim),
+        )
+        self.stem = nn.Conv1d(channels_in, hidden, kernel_size, padding=kernel_size // 2)
+        self.blocks = nn.ModuleList(
+            [
+                TCNResBlock(hidden, kernel_size, dilations[i % len(dilations)], time_dim, dropout)
+                for i in range(n_blocks)
+            ]
+        )
+        self.out_norm = _safe_group_norm(hidden)
+        self.out_proj = nn.Conv1d(hidden, channels_in, kernel_size, padding=kernel_size // 2)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_mlp(self.time_emb(t))
+        h = self.stem(x)
+        for blk in self.blocks:
+            h = blk(h, t_emb)
+        return self.out_proj(F.silu(self.out_norm(h)))
