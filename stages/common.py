@@ -71,6 +71,46 @@ def reference_lr(epoch: int, total: int, tcfg: dict) -> float:
     return lr_peak + (lr_end - lr_peak) * u
 
 
+def make_progress_figure(gen_std: np.ndarray, names: list[str], epoch: int):
+    """4-panel in-training diagnostic (scaled units), matching the legacy runs:
+    ch0-ch1 trajectories | timedelta vs t | altitude vs t | mean±std per channel."""
+    import matplotlib.pyplot as plt
+
+    n, T, C = gen_std.shape
+    t = np.arange(T)
+    tdi = names.index("timedelta") if "timedelta" in names else C - 1
+    ai = names.index("altitude") if "altitude" in names else 2
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    ax = axes[0, 0]
+    for i in range(n):
+        ax.plot(gen_std[i, :, 0], gen_std[i, :, 1], lw=0.9, alpha=0.7)
+    ax.set_xlabel(f"{names[0]} (scaled)")
+    ax.set_ylabel(f"{names[1]} (scaled)")
+    ax.set_title(f"Epoch {epoch} — Generated {names[0]}–{names[1]} (scaled) — {n}/{n}")
+    ax.set_aspect("equal", "datalim")
+
+    for ax, j, ttl in ((axes[0, 1], tdi, "timedelta vs time"), (axes[1, 0], ai, f"{names[ai]} vs time")):
+        for i in range(n):
+            ax.plot(t, gen_std[i, :, j], lw=0.9, alpha=0.7)
+        ax.set_xlabel("time index")
+        ax.set_ylabel(f"{names[j]} (scaled)")
+        ax.set_title(f"Epoch {epoch} — Generated {ttl} (scaled)")
+
+    ax = axes[1, 1]
+    for j, nm in enumerate(names):
+        mu, sd = gen_std[:, :, j].mean(0), gen_std[:, :, j].std(0)
+        (line,) = ax.plot(t, mu, lw=1.8, label=f"orig:{nm}")
+        ax.fill_between(t, mu - sd, mu + sd, color=line.get_color(), alpha=0.15)
+    ax.set_xlabel("time index")
+    ax.set_ylabel("value (scaled)")
+    ax.set_title(f"Epoch {epoch} — Generated mean±std (scaled)")
+    ax.legend(fontsize=8, ncol=2)
+
+    fig.tight_layout()
+    return fig
+
+
 def make_writer(cfg: dict, runs_dir: Path):
     if not cfg.get("logging", {}).get("enabled", True):
         return None

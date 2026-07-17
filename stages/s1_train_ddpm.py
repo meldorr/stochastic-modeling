@@ -18,6 +18,9 @@ import argparse
 import json
 import time
 
+import matplotlib
+
+matplotlib.use("Agg")
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -25,7 +28,7 @@ from src.ddpm import LatentDDPM
 from src.ddpm.ddpm import EMA
 from src.ddpm.registry import build_raw_denoiser
 from src.pipeline.utils import experiment_dirs, get_device, load_experiment_config, set_seed
-from stages.common import load_experiment_data, make_writer, reference_lr
+from stages.common import load_experiment_data, make_progress_figure, make_writer, reference_lr
 
 
 def main() -> None:
@@ -94,6 +97,25 @@ def main() -> None:
                 writer.add_scalar("val/loss", vloss, ep)
             print(f"[{dirs['name']}] epoch {ep:4d}/{epochs} train {train_loss:.4f} "
                   f"val {vloss:.4f} ({time.time() - t0:.0f}s)")
+
+        # in-training sample snapshots (legacy-style 4-panel, scaled units)
+        viz_every = int(cfg.get("viz", {}).get("every", 0))
+        if viz_every and (ep % viz_every == 0 or ep == epochs):
+            ddpm.eval()
+            n_viz = int(cfg.get("viz", {}).get("n", 12))
+            with torch.no_grad():
+                samp = ddpm.sample(n_viz, shape=(C, T), device=device,
+                                   clamp=cfg["ddpm"].get("sample_clamp"))
+            gen_std = samp.cpu().numpy().transpose(0, 2, 1)
+            fig = make_progress_figure(gen_std, data["names"], ep)
+            viz_dir = dirs["results"] / "viz"
+            viz_dir.mkdir(exist_ok=True)
+            fig.savefig(viz_dir / f"epoch_{ep:05d}.png", dpi=110)
+            if writer:
+                writer.add_figure("samples/progress", fig, ep)
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
 
     ema.copy_to(ddpm)
     ddpm.eval()

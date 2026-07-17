@@ -47,7 +47,7 @@ ddpm:
   sample_clamp: 10.0
 
 training:
-  epochs: 2000               # reference converged budget
+  epochs: 2000               # tcn_unet converged budget; fc/fcn need ~19k (set in their yamls)
   batch_size: 128
   lr_start: 5.0e-5           # reference warmup->linear-decay schedule
   lr_peak: 5.0e-4
@@ -60,6 +60,10 @@ training:
 generate:
   n_samples: 1000
   physics_repair: true
+
+viz:                         # in-training sample diagnostics (like the legacy runs)
+  every: 100                 # epochs between snapshot figures; 0 disables
+  n: 12                      # trajectories per snapshot
 
 logging:
   enabled: true
