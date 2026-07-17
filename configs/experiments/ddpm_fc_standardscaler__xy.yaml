@@ -4,4 +4,4 @@ arch: fc
 scaler: standard
 dropout: 0.0
 training:
-  epochs: 19000    # legacy fc runs converged ~19k epochs
+  epochs: 10000

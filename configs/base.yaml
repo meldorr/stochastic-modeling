@@ -47,7 +47,7 @@ ddpm:
   sample_clamp: 10.0
 
 training:
-  epochs: 2000               # tcn_unet converged budget; fc/fcn need ~19k (set in their yamls)
+  epochs: 5000               # default budget (tcn/gstrack/controls); fc/fcn yamls set 10000
   batch_size: 128
   lr_start: 5.0e-5           # reference warmup->linear-decay schedule
   lr_peak: 5.0e-4
