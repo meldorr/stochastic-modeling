@@ -34,8 +34,9 @@ def prepare(config: dict) -> dict:
     dcfg = config["data"]
     seq_len = int(dcfg["seq_len"])
     track_col = dcfg["track_column"]
-    # source columns, with the requested 'track' channel mapped to track_column
-    src_cols = [track_col if f == "track" else f for f in dcfg["features"]]
+    # Store a fixed SUPERSET of channels; experiments subset via data.features.
+    superset = ["x", "y", "altitude", "timedelta", "groundspeed", "track"]
+    src_cols = [track_col if f == "track" else f for f in superset]
 
     raw_path = resolve(config["paths"]["raw_pkl"])
     print(f"[prepare] loading {raw_path} …")
@@ -56,7 +57,7 @@ def prepare(config: dict) -> dict:
             f"(min={sizes.min()}, max={sizes.max()}); resampling guard needed."
         )
     n = len(sizes)
-    print(f"[prepare] {n} flights x {seq_len} steps, features={dcfg['features']}")
+    print(f"[prepare] {n} flights x {seq_len} steps, superset={superset}")
 
     X = df[src_cols].to_numpy(np.float32).reshape(n, seq_len, len(src_cols))
     latlon = df[["latitude", "longitude"]].to_numpy(np.float32).reshape(n, seq_len, 2)
@@ -82,7 +83,7 @@ def prepare(config: dict) -> dict:
     anchor_first = latlon[:, 0, :].copy()
 
     meta = {
-        "feature_names": list(dcfg["features"]),
+        "feature_names": superset,
         "track_column": track_col,
         "seq_len": seq_len,
         "anchor_index": int(dcfg["anchor_index"]),
@@ -99,7 +100,7 @@ def prepare(config: dict) -> dict:
         flight_ids=flight_ids,
         flow=flow,
         runway=runway,
-        feature_names=np.array(dcfg["features"], dtype=object),
+        feature_names=np.array(superset, dtype=object),
         meta_json=json.dumps(meta),
     )
     print(f"[prepare] wrote {out}  (X {X.shape}, {X.nbytes / 1e6:.1f} MB uncompressed)")

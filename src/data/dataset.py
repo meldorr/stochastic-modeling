@@ -99,6 +99,18 @@ def load_dataset(config: dict) -> dict:
     dcfg = config["data"]
     seq_len = int(dcfg["seq_len"])
 
+    # processed.npz stores a channel superset; subset to the configured features.
+    stored = [str(f) for f in d["meta"]["feature_names"]]
+    wanted = [str(f) for f in dcfg["features"]]
+    missing = [f for f in wanted if f not in stored]
+    if missing:
+        raise KeyError(
+            f"features {missing} not in processed.npz (has {stored}) — re-run prepare."
+        )
+    sel = [stored.index(f) for f in wanted]
+    d["X"] = d["X"][:, :, sel]
+    d["meta"] = dict(d["meta"], feature_names=wanted)
+
     X = maybe_resample(d["X"], d["latlon"], dcfg.get("resample", "time"), seq_len)
     train_idx, val_idx = split_indices(len(X), float(dcfg["train_ratio"]), int(config["seed"]))
 
