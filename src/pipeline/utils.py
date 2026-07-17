@@ -35,6 +35,42 @@ def resolve(path: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursive dict merge; overlay wins. Returns a new dict."""
+    out = dict(base)
+    for k, v in overlay.items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load_experiment_config(exp_path: str | Path, base_path: str | Path = "configs/base.yaml") -> dict:
+    """Load base.yaml, overlay an experiment yaml, and resolve data paths.
+
+    The experiment name defaults to the yaml filename stem. The data folder is a
+    single knob: ``paths.data_dir`` (overridable via env ``STOCH_DATA_DIR``);
+    ``paths.processed`` is derived from it unless set explicitly.
+    """
+    base = load_config(base_path)
+    with open(resolve(exp_path)) as fh:
+        overlay = yaml.safe_load(fh) or {}
+    cfg = deep_merge(base, overlay)
+    cfg.setdefault("experiment", Path(exp_path).stem)
+
+    data_dir = os.environ.get("STOCH_DATA_DIR", cfg["paths"]["data_dir"])
+    cfg["paths"]["data_dir"] = data_dir
+    cfg["paths"].setdefault("processed", str(Path(data_dir) / "processed.npz"))
+    return cfg
+
+
+def experiment_dirs(cfg: dict) -> dict[str, Path]:
+    """Per-experiment output folders: results/<exp> and runs/<exp>."""
+    name = cfg["experiment"]
+    res = resolve(cfg["paths"]["results_dir"]) / name
+    runs = resolve(cfg["paths"]["runs_dir"]) / name
+    res.mkdir(parents=True, exist_ok=True)
+    return {"results": res, "runs": runs, "name": name}
+
+
 def ensure_parent(path: str | Path) -> Path:
     """Make sure the parent directory of ``path`` exists; return the resolved path."""
     path = resolve(path)

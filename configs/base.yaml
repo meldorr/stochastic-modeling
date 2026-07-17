@@ -1,0 +1,66 @@
+# Base config for the staged DDPM experiments.
+# Experiment yamls in configs/experiments/ deep-merge on top of this.
+#
+# >>> To relocate the data, change `paths.data_dir` (or set STOCH_DATA_DIR). <<<
+
+seed: 42
+device: auto                 # auto -> cuda > mps > cpu
+
+paths:
+  data_dir: data             # all data lives here; processed cache = <data_dir>/processed.npz
+  raw_pkl: /Users/meldor/Desktop/git/deep-traffic-generation-paper/data/traffic_noga_tilFAF_train.pkl
+  results_dir: results       # per-experiment folders created as <results_dir>/<experiment>
+  runs_dir: runs             # tensorboard: <runs_dir>/<experiment>
+
+data:
+  seq_len: 200
+  train_ratio: 0.9
+  track_column: track_unwrapped
+  anchor_index: -1
+
+# --- raw-ingest spec (Section 1.1-1.3) — used by stages/s0_ingest_raw.py once the
+# raw 2-month ADS-B dump is available; the current pickle is already gridded.
+tma:
+  radius_km: 75.0
+  z_max_m: 4500.0
+  grid_dt_s: 10.0
+  min_duration_s: 180
+  max_gap_s: 60
+
+# --- derived control signals (Section 1.4)
+controls:
+  savgol_window: 21          # ticks; odd. Tuned via consistency sweep on the ~4s grid:
+                             # w=5 fails (28% accel clip, 1.1km@60); w=21 passes (83m@60)
+  savgol_order: 2
+  clip_turn_rate_deg_s: 3.5
+  clip_accel_ms2: 1.5
+  clip_vz_ms: [-15.0, 8.0]
+  consistency_horizon: 60    # steps
+  consistency_max_mean_m: 300.0
+
+ddpm:
+  timesteps: 1000
+  schedule: linear           # reference (diffusion-models-lab) setup
+  beta_start: 1.0e-4
+  beta_end: 2.0e-2
+  cosine_s: 0.008
+  sample_clamp: 10.0
+
+training:
+  epochs: 2000               # reference converged budget
+  batch_size: 128
+  lr_start: 5.0e-5           # reference warmup->linear-decay schedule
+  lr_peak: 5.0e-4
+  lr_end: 1.0e-6
+  weight_decay: 1.0e-4
+  ema_decay: 0.999
+  grad_clip: 1.0
+  val_every: 25
+
+generate:
+  n_samples: 1000
+  physics_repair: true
+
+logging:
+  enabled: true
+  log_every: 50

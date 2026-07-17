@@ -1,0 +1,5 @@
+# Fully-connected denoiser on flattened (C*T), standard scaler, x/y features.
+features: xy
+arch: fc
+scaler: standard
+dropout: 0.0

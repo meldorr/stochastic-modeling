@@ -44,6 +44,48 @@ class FeatureScaler:
         return cls(np.array(d["mean"]), np.array(d["std"]))
 
 
+class MinMaxScaler:
+    """Per-feature min-max to [-1, 1] (the 'no-standardscaler' experiment variant)."""
+
+    def __init__(self, lo: np.ndarray, hi: np.ndarray):
+        self.lo = np.asarray(lo, np.float64)
+        self.hi = np.asarray(hi, np.float64)
+        span = self.hi - self.lo
+        span[span == 0] = 1.0
+        self.span = span
+
+    @classmethod
+    def fit(cls, X: np.ndarray) -> "MinMaxScaler":
+        flat = X.reshape(-1, X.shape[-1])
+        return cls(flat.min(0), flat.max(0))
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (2.0 * (X - self.lo) / self.span - 1.0).astype(np.float32)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return ((X + 1.0) / 2.0 * self.span + self.lo).astype(np.float32)
+
+    def to_dict(self) -> dict:
+        return {"kind": "minmax", "lo": self.lo.tolist(), "hi": self.hi.tolist()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MinMaxScaler":
+        return cls(np.array(d["lo"]), np.array(d["hi"]))
+
+
+def make_scaler(kind: str, X_train: np.ndarray):
+    """standard -> per-feature z-score; minmax -> per-feature [-1, 1]."""
+    if kind == "standard":
+        return FeatureScaler.fit(X_train)
+    if kind == "minmax":
+        return MinMaxScaler.fit(X_train)
+    raise ValueError(f"unknown scaler {kind!r} (standard | minmax)")
+
+
+def scaler_from_dict(d: dict):
+    return MinMaxScaler.from_dict(d) if d.get("kind") == "minmax" else FeatureScaler.from_dict(d)
+
+
 def split_indices(n: int, train_ratio: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     """Deterministic shuffle -> (train_idx, val_idx)."""
     rng = np.random.default_rng(seed)

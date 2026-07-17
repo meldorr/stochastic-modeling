@@ -1,0 +1,6 @@
+# TCN U-Net on derived control signals [turn_rate, along_accel, vert_rate,
+# timedelta] (Section 1.4); generation re-integrates from real entry states.
+features: controls
+arch: tcn_unet
+scaler: standard
+dropout: 0.0

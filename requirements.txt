@@ -13,3 +13,4 @@ matplotlib>=3.10
 PyYAML>=6.0
 tensorboard>=2.18
 tqdm>=4.66
+pytest>=8.0

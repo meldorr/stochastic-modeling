@@ -1,0 +1,5 @@
+# TCN U-Net on the dynamical channels [track, groundspeed, altitude, timedelta].
+features: gstrack
+arch: tcn_unet
+scaler: standard
+dropout: 0.0

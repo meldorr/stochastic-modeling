@@ -42,6 +42,52 @@ train.py  generate.py  evaluate.py  cluster.py  per_cluster_fpca.py
 REPORT.md   ablation results & hypothesis verdicts     archive/  old artifacts
 ```
 
+## Staged DDPM experiments (`stages/` + `configs/experiments/`)
+
+The raw-trajectory diffusion study is organised as **stages** with one results
+folder per named experiment:
+
+```
+stages/s0_prepare.py      data -> <data_dir>/processed.npz  (only stage needing `traffic`;
+                          raw-ADS-B ingest per spec §1.1-1.3 stubbed until the raw dump lands)
+stages/s1_train_ddpm.py   train one experiment  -> results/<experiment>/ckpt.pt
+stages/s2_generate.py     sample randomly       -> results/<experiment>/generated.{npz,parquet} + profiles.png
+stages/s3_evaluate.py     metrics + figures     -> results/<experiment>/metrics.json + spatial.png
+```
+
+**Experiments are named yamls** overlaying `configs/base.yaml`
+(`<network>_<denoiser>_<scaler>[_dropout]__<features>`):
+
+| experiment | arch | features |
+|---|---|---|
+| `ddpm_fc_standardscaler__xy` | fully-connected | x, y, alt, Δt |
+| `ddpm_fcn_unet_standardscaler__xy` | FC U-Net | x, y, alt, Δt |
+| `ddpm_tcn_unet_standardscaler__xy` | reference TCN U-Net | x, y, alt, Δt |
+| `ddpm_tcn_unet_standardscaler_dropout__xy` | TCN U-Net, dropout 0.1 | x, y, alt, Δt |
+| `ddpm_tcn_unet_standardscaler__gstrack` | TCN U-Net | track, gs, alt, Δt |
+| `ddpm_tcn_unet_standardscaler__controls` | TCN U-Net | **derived controls** χ̇, a, ż, Δt |
+
+The **controls** experiment implements spec §1.4: SavGol-smoothed finite-difference
+kinematics with envelope clips; generation samples control sequences and
+**re-integrates** them from real entry states into absolute x/y/z tracks.
+The §1.4 consistency requirement is enforced by
+`pytest tests/test_controls_consistency.py` (re-integration of real controls must
+stay < 300 m mean at 60 steps — passes at 83 m with SavGol w=21 + trapezoidal
+integration; w=5 fails at 1.1 km, 28% accel-clip rate).
+
+Run (device auto-detected; **change the data location via `paths.data_dir` in
+`configs/base.yaml` or `STOCH_DATA_DIR=/path`**):
+
+```bash
+bash run_experiments.sh                                  # all six
+bash run_experiments.sh ddpm_tcn_unet_standardscaler__xy # one
+EPOCHS=2 N_GEN=64 bash run_experiments.sh                # smoke
+pytest tests/ -q                                         # consistency gate
+```
+
+New experiment = new yaml in `configs/experiments/` (pick `features`, `arch`,
+`scaler: standard|minmax`, `dropout`, plus any base override).
+
 ## Running on another device (e.g. your CUDA machine)
 
 The pipeline is fully portable once `data/processed.npz` exists — **no `traffic`

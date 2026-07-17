@@ -1,0 +1,5 @@
+# Fully-connected U-Net on flattened (C*T), standard scaler, x/y features.
+features: xy
+arch: fcn_unet
+scaler: standard
+dropout: 0.0

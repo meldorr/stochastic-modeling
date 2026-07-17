@@ -1,0 +1,5 @@
+# Reference TCN U-Net (diffusion-models-lab), standard scaler, x/y features.
+features: xy
+arch: tcn_unet
+scaler: standard
+dropout: 0.0

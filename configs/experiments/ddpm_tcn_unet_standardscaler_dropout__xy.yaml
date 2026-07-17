@@ -1,0 +1,5 @@
+# TCN U-Net with dropout 0.1 (the reference default), standard scaler, x/y.
+features: xy
+arch: tcn_unet
+scaler: standard
+dropout: 0.1
