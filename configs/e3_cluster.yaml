@@ -1,0 +1,107 @@
+seed: 42
+device: auto
+paths:
+  raw_pkl: /Users/meldor/Desktop/git/deep-traffic-generation-paper/data/traffic_noga_tilFAF_train.pkl
+  processed: data/processed.npz
+  checkpoint: checkpoints/e3_cluster.pt
+  generated: results/e3_cluster/generated.parquet
+  results_dir: results/e3_cluster
+data:
+  features:
+  - x
+  - y
+  - altitude
+  - timedelta
+  track_column: track_unwrapped
+  anchor_index: -1
+  seq_len: 200
+  train_ratio: 0.9
+  resample: time
+fpca:
+  basis: discrete
+  explained_variance:
+    default: 0.99
+    track: 0.99
+  max_components: 200
+  bspline:
+    n_basis: 40
+    degree: 3
+    smoothing: 0.001
+ddpm:
+  timesteps: 1000
+  schedule: cosine
+  cosine_s: 0.008
+  beta_start: 0.0001
+  beta_end: 0.02
+  sample_clamp: 10.0
+denoiser:
+  hidden_dim: 256
+  n_blocks: 4
+  time_dim: 128
+  dropout: 0.0
+tcn_denoiser:
+  channels: 64
+  n_blocks: 8
+  kernel_size: 3
+  dilations:
+  - 1
+  - 2
+  - 4
+  - 8
+  time_dim: 128
+  dropout: 0.0
+unet_denoiser:
+  hidden_dim: 256
+  depth: 3
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  blocks_per_level: 2
+  time_dim: 128
+  dropout: 0.0
+training:
+  epochs: 1200
+  batch_size: 256
+  lr: 0.0005
+  lr_init: 1.0e-05
+  lr_min: 1.0e-06
+  warmup_epochs: 100
+  weight_decay: 0.0001
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 0
+  val_every: 25
+logging:
+  tensorboard_dir: runs
+  log_every: 25
+  enabled: true
+generate:
+  n_samples: 2000
+  physics_repair: true
+  physics_reject: true
+  reject_max_tries: 5
+  cluster_mix: null
+evaluate:
+  n_real: 2000
+  n_gen: 2000
+cluster:
+  enabled: true
+  basis: xy_flat
+  features:
+  - x
+  - y
+  method: kmeans
+  k: 5
+  k_sweep:
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  stride: 4
+  hdbscan_min: 200
+  compare_bases: true
+  labels_out: results/cluster_labels.npz

@@ -29,14 +29,52 @@ without picking a mixture order or fighting mode collapse.
 
 ```
 src/
-  data/      prepare.py  (traffic .pkl -> processed.npz)   dataset.py (standardize, split, bounds)
-  fpca/      fpca.py     (per-variable discrete fPCA + LatentScaler)
-  ddpm/      schedule.py (cosine/linear)  denoiser.py (MLP + sinusoidal t-emb)  ddpm.py (LatentDDPM + EMA)
-  pipeline/  utils.py  reconstruct.py (geodesic walk + physics)  checkpoint.py
-configs/config.yaml     everything: paths, features, fpca, ddpm, training, logging
-train.py  generate.py  evaluate.py     entrypoints
-notebooks/explore.ipynb                data + fPCA exploration
+  data/      prepare.py  (traffic .pkl -> processed.npz, 6-channel superset)
+             dataset.py  (feature subsetting, standardize, split, bounds)
+  fpca/      fpca.py     (discrete + Jarry B-spline fPCA, LatentScaler)
+  ddpm/      schedule.py  denoiser.py (MLP/TCN/UNet latent + TrajTCN raw-space)
+             ddpm.py     (shape-agnostic DDPM + EMA)
+  cluster/   cluster.py (exploration)  assigner.py (persistable k-means)
+  pipeline/  utils.py  reconstruct.py (physics + direct x/y)  checkpoint.py (single & per-cluster)
+experiments/ e1_smoothing.py  e4_raw.py  eval_gen.py  common.py   (ablation study)
+configs/     config.yaml + e2_global.yaml + e3_cluster.yaml
+train.py  generate.py  evaluate.py  cluster.py  per_cluster_fpca.py
+REPORT.md   ablation results & hypothesis verdicts     archive/  old artifacts
 ```
+
+## Running on another device (e.g. your CUDA machine)
+
+The pipeline is fully portable once `data/processed.npz` exists — **no `traffic`
+library and no raw pickle needed** (only Stage-1 prepare requires them, and the
+npz ships pre-built). Note `.gitignore` excludes `data/*.npz`, so copy it manually:
+
+```bash
+# on the target machine
+git clone <this repo> && cd stochastic-modeling
+scp <dev-machine>:.../stochastic-modeling/data/processed.npz data/   # 59 MB
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt         # install torch with CUDA per pytorch.org
+
+bash run_ablation.sh                    # full chain E1 -> E2 -> E3 -> E4 (auto-detects CUDA)
+# or pieces:
+SKIP_E1=1 SKIP_E2=1 SKIP_E3=1 bash run_ablation.sh        # E4 only (U-Net, 2000 epochs)
+E4_EPOCHS=500 bash run_ablation.sh                        # custom E4 budget
+python experiments/e4_raw.py --features xy --arch unet    # single experiment by hand
+tensorboard --logdir runs
+```
+
+Device selection is automatic (CUDA > MPS > CPU). E4's default budget is
+2000 epochs (the reference model's converged setting); on an RTX-class GPU
+expect minutes-per-100-epochs rather than the ~68 min/100 on Apple MPS.
+
+## Ablation study
+
+`REPORT.md` documents the ordered study: **E1** representation fidelity (spline vs
+fPCA on dynamical channels vs direct x/y, with dead-reckoning control), **E2** global
+fPCA+DDPM on x/y, **E3** per-cluster fPCA+DDPM, **E4** raw-space diffusion baselines.
+Each experiment writes to `results/<exp>/`; shared generative metrics come from
+`experiments/eval_gen.py` (marginal KS, sliced-Wasserstein on paths, endpoint KS,
+envelope plausibility).
 
 ## Environment
 
