@@ -20,6 +20,25 @@ Reproduce: `experiments/e1_smoothing.py`, then the chain
 then `experiments/e4_raw.py --features {dyn,xy}`; shared scores via `experiments/eval_gen.py`.
 All artifacts under `results/<exp>/`.
 
+**A note on splines — motivation vs. value here.** Wherever splines appear in
+these experiments, keep the framing honest: in the source literature the spline
+stage is *load-bearing* — Jarry 2022 needs curves in the Sobolev space 𝕎² for
+his FDA/Karhunen-Loève machinery, continuous evaluation at arbitrary t for his
+deformation operators (rotate/dilate/cut at "the time the mean crosses 1000 ft"),
+registration at non-grid landmarks, and smooth profiles for noise simulation.
+**None of those obligations bind our setting** (pre-gridded common 200-tick data,
+vector-consuming DDPM, no deformation ops), so for us the spline stage reduces to
+a smoothing prior — and whether that prior *adds any value for generation* is an
+open question we explicitly assess rather than assume:
+- representation side (**answered by E1**): harmful on dynamical channels
+  (double-smoothing), the most compact accurate basis on x/y (202 m @ ~20 coeffs);
+- generation side (**pending ablation**): latent DDPM on spline-fPCA scores
+  (`fpca.basis: bspline`, one config line) vs discrete-fPCA E2/E3 — would test
+  whether construction-guaranteed smoothness of decoded samples beats
+  `physics_repair`-based cleanup on the shared scorecard. To be queued after the
+  raw-space matrix; splines regain first-class status only if/when raw irregular
+  ADS-B ingest (spec 1.1-1.3) lands, where a common basis becomes mandatory.
+
 ---
 
 ## E1 — Representation study (no training): does smoothing kill the dynamics?
