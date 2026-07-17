@@ -10,3 +10,5 @@ runs/
 checkpoints/*.pt
 results/
 archive/
+results_remote/
+runs_remote/
