@@ -42,10 +42,16 @@ def load_experiment_data(cfg: dict) -> dict:
     col = {n: d["X"][:, :, stored.index(n)].astype(np.float64) for n in stored}
 
     aux: dict = {"real_xy": np.stack([col["x"], col["y"]], axis=-1)}
+    flow = d["flow"]
     if fs == "controls":
         der = derive_controls(col["x"], col["y"], col["altitude"], col["timedelta"], cfg["controls"])
-        X = der["controls"].astype(np.float32)
-        aux.update(entry=der["entry"], clip_rates=der["clip_rates"])
+        ok = der["valid_mask"]                # drop gap-interpolation artifact flights
+        print(f"[data] controls: excluding {int((~ok).sum())}/{len(ok)} artifact flights "
+              f"({100 * (~ok).mean():.1f}%)")
+        X = der["controls"][ok].astype(np.float32)
+        aux.update(entry=der["entry"][ok], clip_rates=der["clip_rates"])
+        aux["real_xy"] = aux["real_xy"][ok]
+        flow = flow[ok]
     else:
         X = np.stack([col[n] for n in names], axis=-1).astype(np.float32)
 
@@ -57,7 +63,7 @@ def load_experiment_data(cfg: dict) -> dict:
     return {
         "X": X, "X_std": scaler.transform(X), "names": names, "feature_set": fs,
         "scaler": scaler, "bounds": bounds, "train_idx": tr, "val_idx": va,
-        "aux": aux, "flow": d["flow"],
+        "aux": aux, "flow": flow,
     }
 
 

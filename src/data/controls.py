@@ -31,9 +31,18 @@ def _per_flight_dt(td: np.ndarray) -> np.ndarray:
 
 
 def derive_controls(x, y, alt_ft, td, cfg: dict) -> dict:
-    """All inputs (N, T). Returns controls, entry states, smoothed gs/chi, clip rates."""
+    """All inputs (N, T). Returns controls, entry states, smoothed gs/chi, clip rates.
+
+    Robustness (motivated by ~1% of flights containing near-stationary
+    interpolation artifacts): velocities come from Savitzky-Golay *derivative*
+    filters (smooth-then-differentiate), and the heading is bridged by
+    interpolation across spans where gs < ``gs_floor_ms`` — at near-zero speed
+    arctan2 returns the angle of noise, whose fake ±180° flips otherwise unwrap
+    into kilometres of drift after integration.
+    """
     win = int(cfg.get("savgol_window", 5))
     order = int(cfg.get("savgol_order", 2))
+    gs_floor = float(cfg.get("gs_floor_ms", 30.0))
     dt = _per_flight_dt(td)[:, None]                       # (N, 1)
 
     z = alt_ft * FT_TO_M
@@ -41,6 +50,13 @@ def derive_controls(x, y, alt_ft, td, cfg: dict) -> dict:
     vy = np.gradient(y, axis=1) / dt
     gs = np.hypot(vx, vy)
     chi = np.unwrap(np.arctan2(vx, vy), axis=1)            # 0 = north, clockwise positive
+
+    # Artifact flag (spec 1.3: gaps must be discarded, not interpolated): a real
+    # approach never flies < ~gs_floor m/s, so near-stationary samples mean the
+    # source data was gap-interpolated. Heading there is the angle of noise and
+    # no clipped-control sequence can reproduce the fake speed cliff -> these
+    # flights are unreconstructable-by-design and are flagged, not "fixed".
+    valid_mask = gs.min(axis=1) >= gs_floor                # (N,)
 
     # smooth BEFORE differencing (jitter amplification)
     gs_s = savgol_filter(gs, win, order, axis=1)
@@ -70,6 +86,7 @@ def derive_controls(x, y, alt_ft, td, cfg: dict) -> dict:
         "entry": entry.astype(np.float32),                 # (N, 5)
         "gs": gs_s, "chi": chi_s, "z": z_s,
         "clip_rates": clip_rates,
+        "valid_mask": valid_mask,                          # (N,) False = gap-interpolation artifact
         "dt": dt[:, 0],
     }
 
@@ -95,14 +112,22 @@ def integrate_controls(entry: np.ndarray, controls: np.ndarray) -> np.ndarray:
 
 
 def consistency_errors(x, y, alt_ft, td, cfg: dict, horizon: int = 60) -> dict:
-    """Derive -> re-integrate -> horizontal error vs source track (metres)."""
+    """Derive -> re-integrate -> horizontal error vs source track (metres).
+
+    Scored on valid flights only; gap-interpolation artifacts (see
+    ``valid_mask`` in :func:`derive_controls`) are counted, not scored.
+    """
     d = derive_controls(x, y, alt_ft, td, cfg)
-    xyz = integrate_controls(d["entry"], d["controls"])
-    err = np.hypot(xyz[:, :, 0] - x, xyz[:, :, 1] - y)     # (N, T)
+    ok = d["valid_mask"]
+    xyz = integrate_controls(d["entry"][ok], d["controls"][ok])
+    err = np.hypot(xyz[:, :, 0] - x[ok], xyz[:, :, 1] - y[ok])
     h = min(horizon, err.shape[1])
     return {
         "mean_m_at_horizon": float(err[:, :h].mean()),
         "final_m_at_horizon": float(err[:, h - 1].mean()),
         "mean_m_full": float(err.mean()),
+        "p99_mean_m_full": float(np.percentile(err.mean(1), 99)),
+        "max_mean_m_full": float(err.mean(1).max()),
+        "artifact_fraction": float(1.0 - ok.mean()),
         "clip_rates": d["clip_rates"],
     }

@@ -89,6 +89,14 @@ def main() -> None:
     trk = d_dyn["X"][sel][:, :, nd.index("track")].astype(float)
     gs = d_dyn["X"][sel][:, :, nd.index("groundspeed")].astype(float)
 
+    # exclude gap-interpolation artifact flights (spec 1.3 says discard) — for ALL routes
+    der_all = derive_controls(x, y, alt, td, cfg["controls"])
+    ok = der_all["valid_mask"]
+    print(f"[e5] artifact flights excluded: {int((~ok).sum())}/{len(ok)} "
+          f"({100 * (~ok).mean():.1f}%) — near-stationary gap interpolation")
+    x, y, alt, td, trk, gs = (a[ok] for a in (x, y, alt, td, trk, gs))
+    xy_true = np.stack([x, y], axis=-1)
+
     routes = {}
     routes["deadreckon gs/track (euler)"] = deadreckon(trk, gs, td, x[:, 0], y[:, 0], "euler")
     routes["deadreckon gs/track (trapezoid)"] = deadreckon(trk, gs, td, x[:, 0], y[:, 0], "trapezoid")

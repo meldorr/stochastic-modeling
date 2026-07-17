@@ -32,6 +32,7 @@ controls:
   savgol_window: 21          # ticks; odd. Tuned via consistency sweep on the ~4s grid:
                              # w=5 fails (28% accel clip, 1.1km@60); w=21 passes (83m@60)
   savgol_order: 2
+  gs_floor_ms: 30.0        # heading bridged where gs < floor (stationary artifacts)
   clip_turn_rate_deg_s: 3.5
   clip_accel_ms2: 1.5
   clip_vz_ms: [-15.0, 8.0]

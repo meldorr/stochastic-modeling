@@ -63,6 +63,14 @@ def test_reintegration_error_under_300m_at_60_steps(flights):
     )
 
 
+def test_artifact_fraction_is_small(flights):
+    (x, y, alt, td), ccfg = flights
+    r = consistency_errors(x, y, alt, td, ccfg)
+    assert r["artifact_fraction"] < 0.05, (
+        f"{r['artifact_fraction']:.1%} flights flagged as gap-interpolation artifacts"
+    )
+
+
 def test_clip_rates_are_low(flights):
     (x, y, alt, td), ccfg = flights
     d = derive_controls(x, y, alt, td, ccfg)
