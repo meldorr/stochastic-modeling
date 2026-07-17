@@ -111,12 +111,36 @@ def make_progress_figure(gen_std: np.ndarray, names: list[str], epoch: int):
     return fig
 
 
+class SafeWriter:
+    """TensorBoard writer wrapper: logging failures must never kill training.
+
+    (Motivated by a run lost to a FileNotFoundError inside the async event
+    writer thread propagating out of ``add_scalar``.)
+    """
+
+    def __init__(self, writer):
+        self._w = writer
+
+    def __getattr__(self, name):
+        fn = getattr(self._w, name)
+
+        def safe(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            except Exception as e:  # noqa: BLE001 — deliberately broad
+                print(f"[tb] {name} failed ({type(e).__name__}: {e}) — continuing")
+                return None
+
+        return safe if callable(fn) else fn
+
+
 def make_writer(cfg: dict, runs_dir: Path):
     if not cfg.get("logging", {}).get("enabled", True):
         return None
     try:
         from torch.utils.tensorboard import SummaryWriter
 
-        return SummaryWriter(log_dir=str(runs_dir))
+        Path(runs_dir).mkdir(parents=True, exist_ok=True)
+        return SafeWriter(SummaryWriter(log_dir=str(runs_dir)))
     except Exception:
         return None

@@ -55,7 +55,7 @@ case "$cmd" in
     ;;
   launch)
     ARGS="$*"
-    $SSH "cd $REMOTE_DIR && mkdir -p results && PYBIN=$REMOTE_PY && STOCH_RAW_PKL='$REMOTE_RAW_PKL' PY=\$PYBIN EPOCHS='${EPOCHS:-}' N_GEN='${N_GEN:-}' nohup bash run_experiments.sh $ARGS > results/nohup.out 2>&1 & echo \"launched pid \$!\""
+    $SSH "cd $REMOTE_DIR && mkdir -p results runs && PYBIN=$REMOTE_PY && STOCH_RAW_PKL='$REMOTE_RAW_PKL' PY=\$PYBIN EPOCHS='${EPOCHS:-}' N_GEN='${N_GEN:-}' nohup bash run_experiments.sh $ARGS > results/nohup.out 2>&1 & echo \"launched pid \$!\""
     ;;
   status)
     $SSH "cd $REMOTE_DIR 2>/dev/null && { echo '--- last log ---'; tail -15 results/experiments_run.log 2>/dev/null || tail -15 results/nohup.out 2>/dev/null || echo 'no log yet'; echo '--- procs ---'; pgrep -af 'stages/s1|run_experiments' || echo 'nothing running'; echo '--- gpu ---'; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null; }"
