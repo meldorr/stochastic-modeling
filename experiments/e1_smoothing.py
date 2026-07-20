@@ -34,14 +34,13 @@ import numpy as np
 from experiments.common import (
     DYN,
     XY,
-    dead_reckon,
     hf_retention,
     load_features,
     out_dir,
-    path_errors,
     raw_rmse_named,
     save_json,
 )
+from src.data.reckoning import deadreckon_from_faf, entry_drift
 from src.fpca import FPCA
 from src.pipeline.utils import load_config
 
@@ -68,13 +67,14 @@ def eval_dyn_rep(rep, d_dyn, xy_true, va):
     real_raw = d_dyn["X"][va]
 
     ti, gi, tdi = names.index("track"), names.index("groundspeed"), names.index("timedelta")
-    xy_hat = dead_reckon(rec_raw[:, :, ti], rec_raw[:, :, gi], rec_raw[:, :, tdi],
-                         xy_true[:, 0, 0], xy_true[:, 0, 1])
+    # reverse from the FAF (true last point), measure drift at entry
+    xy_hat = deadreckon_from_faf(rec_raw[:, :, ti], rec_raw[:, :, gi], rec_raw[:, :, tdi],
+                                 xy_true[:, -1, :], gs_factor=1.0)
     return {
         "rmse_raw": raw_rmse_named(rec_std, Xs_va, d_dyn["scaler"], names),
         "hf_gs": hf_retention(rec_raw[:, :, gi], real_raw[:, :, gi]),
         "hf_track": hf_retention(rec_raw[:, :, ti], real_raw[:, :, ti]),
-        "path": path_errors(xy_hat, xy_true),
+        "drift": entry_drift(xy_hat, xy_true),
         "m": int(rep.m),
     }, rec_raw, xy_hat
 
@@ -89,7 +89,7 @@ def eval_xy_rep(rep, d_xy, va):
     xy_true = d_xy["X"][va][:, :, [xi, yi]].astype(np.float64)
     return {
         "rmse_raw": raw_rmse_named(rec_std, Xs_va, d_xy["scaler"], names),
-        "path": path_errors(xy_hat, xy_true),
+        "drift": entry_drift(xy_hat, xy_true),      # direct decode; drift = decode error at entry
         "m": int(rep.m),
     }, rec_raw, xy_hat
 
@@ -106,13 +106,13 @@ def main() -> None:
 
     rows, recons = {}, {}
 
-    # control: dead-reckon with REAL dynamics (pure integration error)
+    # control: FAF-reverse dead-reckon with REAL dynamics (pure integration floor)
     real_raw = d_dyn["X"][va]
     names_d = d_dyn["feature_names"]
     ti, gi, tdi = names_d.index("track"), names_d.index("groundspeed"), names_d.index("timedelta")
-    xy_dr_real = dead_reckon(real_raw[:, :, ti], real_raw[:, :, gi], real_raw[:, :, tdi],
-                             xy_true[:, 0, 0], xy_true[:, 0, 1])
-    rows["dyn|real|deadreckon-control"] = {"path": path_errors(xy_dr_real, xy_true), "m": None}
+    xy_dr_real = deadreckon_from_faf(real_raw[:, :, ti], real_raw[:, :, gi], real_raw[:, :, tdi],
+                                     xy_true[:, -1, :], gs_factor=1.0)
+    rows["dyn|real|deadreckon-control"] = {"drift": entry_drift(xy_dr_real, xy_true), "m": None}
 
     # dyn representations
     for kind, params in (("bspline", BSPLINE_NBASIS), ("fpca", FPCA_EV)):
@@ -122,7 +122,7 @@ def main() -> None:
             rows[key], rec_raw, xy_hat = eval_dyn_rep(rep, d_dyn, xy_true, va)
             recons[key] = (rec_raw, xy_hat)
             print(f"[e1] {key:24s} m={rows[key]['m']:3d} "
-                  f"path mean={rows[key]['path']['mean_m']:.0f}m final={rows[key]['path']['final_m']:.0f}m "
+                  f"entry drift={rows[key]['drift']['entry_mean_m']:.0f}m "
                   f"hf_gs={rows[key].get('hf_gs', float('nan')):.2f} hf_track={rows[key].get('hf_track', float('nan')):.2f}")
 
     # xy representations
@@ -132,18 +132,17 @@ def main() -> None:
             key = f"xy|{kind}|{p}"
             rows[key], rec_raw, xy_hat = eval_xy_rep(rep, d_xy, va)
             recons[key] = (rec_raw, xy_hat)
-            print(f"[e1] {key:24s} m={rows[key]['m']:3d} "
-                  f"path mean={rows[key]['path']['mean_m']:.0f}m final={rows[key]['path']['final_m']:.0f}m")
+            print(f"[e1] {key:24s} m={rows[key]['m']:3d} entry drift={rows[key]['drift']['entry_mean_m']:.0f}m")
 
     save_json(out / "metrics.json", rows)
 
     # ---- table.md ----
-    lines = ["| representation | m | path mean (m) | path final (m) | gs RMSE (kts) | track RMSE (deg) | hf gs | hf track |",
+    lines = ["| representation | m | entry drift mean (m) | entry p90 (m) | gs RMSE (kts) | track RMSE (deg) | hf gs | hf track |",
              "|---|---|---|---|---|---|---|---|"]
     for k, r in rows.items():
         rm = r.get("rmse_raw", {})
         lines.append(
-            f"| {k} | {r.get('m') or '—'} | {r['path']['mean_m']:.0f} | {r['path']['final_m']:.0f} "
+            f"| {k} | {r.get('m') or '—'} | {r['drift']['entry_mean_m']:.0f} | {r['drift']['entry_p90_m']:.0f} "
             f"| {rm.get('groundspeed', float('nan')):.2f} | {rm.get('track', float('nan')):.2f} "
             f"| {r.get('hf_gs', float('nan')):.2f} | {r.get('hf_track', float('nan')):.2f} |"
         )
@@ -189,23 +188,23 @@ def main() -> None:
     fig.savefig(out / "path_comparison.png", dpi=130)
     plt.close(fig)
 
-    # 3) bar chart: mean path error
+    # 3) bar chart: entry drift by representation
     keys = [k for k in rows if k != "dyn|real|deadreckon-control"]
     fig, ax = plt.subplots(figsize=(10, 4.2))
-    vals = [rows[k]["path"]["mean_m"] for k in keys]
+    vals = [rows[k]["drift"]["entry_mean_m"] for k in keys]
     colors = ["#d62728" if k.startswith("dyn|bspline") else
               "#1f77b4" if k.startswith("dyn|fpca") else
               "#ff9896" if k.startswith("xy|bspline") else "#2ca02c" for k in keys]
     ax.bar(range(len(keys)), vals, color=colors)
-    ax.axhline(rows["dyn|real|deadreckon-control"]["path"]["mean_m"], color="gray", ls="--",
-               label="control: dead-reckon w/ real dynamics")
+    ax.axhline(rows["dyn|real|deadreckon-control"]["drift"]["entry_mean_m"], color="gray", ls="--",
+               label="control: FAF-reverse dead-reckon w/ real dynamics")
     ax.set_xticks(range(len(keys)))
     ax.set_xticklabels([k.replace("|", "\n") for k in keys], fontsize=7)
-    ax.set_ylabel("mean path error (m)")
+    ax.set_ylabel("mean entry drift (m)")
     ax.set_yscale("log")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3, axis="y")
-    ax.set_title("E1: mean position error by representation (log scale)")
+    ax.set_title("E1: entry drift by representation, FAF-anchored (log scale)")
     fig.tight_layout()
     fig.savefig(out / "path_error_bars.png", dpi=130)
     plt.close(fig)

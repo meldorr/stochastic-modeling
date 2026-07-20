@@ -81,9 +81,11 @@ def derive_controls(x, y, alt_ft, td, cfg: dict) -> dict:
 
     controls = np.stack([chidot, accel, vz, td], axis=-1).astype(np.float32)   # (N, T, 4)
     entry = np.stack([x[:, 0], y[:, 0], z_s[:, 0], gs_s[:, 0], chi_s[:, 0]], axis=-1)
+    faf = np.stack([x[:, -1], y[:, -1], z_s[:, -1], gs_s[:, -1], chi_s[:, -1]], axis=-1)
     return {
         "controls": controls,
-        "entry": entry.astype(np.float32),                 # (N, 5)
+        "entry": entry.astype(np.float32),                 # (N, 5) state at entry
+        "faf": faf.astype(np.float32),                     # (N, 5) state at FAF (anchor)
         "gs": gs_s, "chi": chi_s, "z": z_s,
         "clip_rates": clip_rates,
         "valid_mask": valid_mask,                          # (N,) False = gap-interpolation artifact

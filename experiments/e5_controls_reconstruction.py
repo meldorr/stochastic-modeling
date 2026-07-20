@@ -1,31 +1,29 @@
-"""E5 — Position reconstruction: derived controls vs gs/track dead-reckoning.
+"""E5 — FAF-anchored reconstruction: derived controls vs gs/track dead-reckoning.
 
     python experiments/e5_controls_reconstruction.py
 
-Claim under test: re-integrating *derived* control signals (turn rate, along-track
-accel, vertical rate; SavGol w=21 + trapezoid — spec Section 1.4) reconstructs the
-flown track far better than dead-reckoning the *recorded* groundspeed/track channels.
+Reconstruction follows the literature (deep-traffic-generation-paper
+`_walk_latlon(forward=False)`): anchor at the **FAF** (fixed known destination)
+and integrate **backward** in time, so error accumulates at the **entry** point —
+which is where we measure drift. Both representations get the identical anchor and
+horizon:
 
-Why it wins (and why this is fair): the controls are derived from the positions
-themselves, so the (derive -> integrate) round trip is self-consistent; recorded
-gs/track are independent measurements that do not exactly match the position
-increments, giving dead-reckoning an irreducible error floor (E1). Both routes
-below get the same flights, entry states and horizons; dead-reckoning is scored
-with both Euler (as used operationally) and trapezoid (same integrator as the
-controls route) so the integrator is not the confound.
+    * gs/track  -> `deadreckon_from_faf` (Euler, bearing-flip); factor 1.0 (our UTM
+      plane; the reference's 0.99 is worse here) and 0.99 (reference) both shown;
+    * controls  -> `integrate_controls_from_faf` (backward trapezoid from FAF state).
 
+Gap-interpolation artifact flights (Section 1.3) are excluded from all routes.
 Writes results/e5_controls_reconstruction/{metrics.json, table.md, overlay.png,
 error_growth.png}.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import json
 
 import matplotlib
 
@@ -33,38 +31,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from experiments.common import DYN, XY, KTS_TO_MS, load_features, out_dir
-from src.data.controls import derive_controls, integrate_controls
+from experiments.common import DYN, XY, load_features, out_dir
+from src.data.controls import derive_controls
+from src.data.reckoning import deadreckon_from_faf, entry_drift, integrate_controls_from_faf
 from src.pipeline.utils import load_config
 
 N_SAMPLE = 2000
-HORIZONS = (60, 199)
-
-
-def deadreckon(track_deg, gs_kts, td, x0, y0, scheme="euler"):
-    """Integrate recorded track/groundspeed to positions. (N, T) inputs."""
-    dt = np.diff(td, axis=1)
-    vx = gs_kts * KTS_TO_MS * np.sin(np.radians(track_deg))
-    vy = gs_kts * KTS_TO_MS * np.cos(np.radians(track_deg))
-    if scheme == "trapezoid":
-        ix = 0.5 * (vx[:, :-1] + vx[:, 1:]) * dt
-        iy = 0.5 * (vy[:, :-1] + vy[:, 1:]) * dt
-    else:
-        ix = vx[:, :-1] * dt
-        iy = vy[:, :-1] * dt
-    x = np.concatenate([x0[:, None], x0[:, None] + np.cumsum(ix, axis=1)], axis=1)
-    y = np.concatenate([y0[:, None], y0[:, None] + np.cumsum(iy, axis=1)], axis=1)
-    return np.stack([x, y], axis=-1)
-
-
-def err_stats(xy_hat, xy_true):
-    e = np.hypot(xy_hat[:, :, 0] - xy_true[:, :, 0], xy_hat[:, :, 1] - xy_true[:, :, 1])
-    row = {}
-    for h in HORIZONS:
-        row[f"mean_m@{h}"] = float(e[:, : h + 1].mean())
-        row[f"final_m@{h}"] = float(e[:, h].mean())
-        row[f"p90_final_m@{h}"] = float(np.percentile(e[:, h], 90))
-    return row, e
 
 
 def main() -> None:
@@ -78,92 +50,83 @@ def main() -> None:
     rng = np.random.default_rng(0)
     sel = va[rng.choice(len(va), min(N_SAMPLE, len(va)), replace=False)]
 
-    nx = d_xy["feature_names"]
-    x = d_xy["X"][sel][:, :, nx.index("x")].astype(float)
-    y = d_xy["X"][sel][:, :, nx.index("y")].astype(float)
-    alt = d_xy["X"][sel][:, :, nx.index("altitude")].astype(float)
-    td = d_xy["X"][sel][:, :, nx.index("timedelta")].astype(float)
-    xy_true = np.stack([x, y], axis=-1)
-
-    nd = d_dyn["feature_names"]
+    nx, nd = d_xy["feature_names"], d_dyn["feature_names"]
+    x, y, alt, td = (d_xy["X"][sel][:, :, nx.index(c)].astype(float)
+                     for c in ("x", "y", "altitude", "timedelta"))
     trk = d_dyn["X"][sel][:, :, nd.index("track")].astype(float)
     gs = d_dyn["X"][sel][:, :, nd.index("groundspeed")].astype(float)
 
-    # exclude gap-interpolation artifact flights (spec 1.3 says discard) — for ALL routes
-    der_all = derive_controls(x, y, alt, td, cfg["controls"])
-    ok = der_all["valid_mask"]
+    der = derive_controls(x, y, alt, td, cfg["controls"])
+    ok = der["valid_mask"]
     print(f"[e5] artifact flights excluded: {int((~ok).sum())}/{len(ok)} "
-          f"({100 * (~ok).mean():.1f}%) — near-stationary gap interpolation")
+          f"({100 * (~ok).mean():.1f}%)")
     x, y, alt, td, trk, gs = (a[ok] for a in (x, y, alt, td, trk, gs))
     xy_true = np.stack([x, y], axis=-1)
+    faf_xy = xy_true[:, -1, :]                       # FAF anchor = true last point
+    controls, faf_state = der["controls"][ok], der["faf"][ok]
 
-    routes = {}
-    routes["deadreckon gs/track (euler)"] = deadreckon(trk, gs, td, x[:, 0], y[:, 0], "euler")
-    routes["deadreckon gs/track (trapezoid)"] = deadreckon(trk, gs, td, x[:, 0], y[:, 0], "trapezoid")
-    der = derive_controls(x, y, alt, td, cfg["controls"])
-    routes["derived controls (SavGol21+trapezoid)"] = integrate_controls(der["entry"], der["controls"])[:, :, :2]
+    routes = {
+        "gs/track FAF (factor 1.0)": deadreckon_from_faf(trk, gs, td, faf_xy, gs_factor=1.0),
+        "gs/track FAF (factor 0.99, ref)": deadreckon_from_faf(trk, gs, td, faf_xy, gs_factor=0.99),
+        "derived controls FAF": integrate_controls_from_faf(faf_state, controls)[:, :, :2],
+    }
 
     metrics, curves = {}, {}
     for name, xy_hat in routes.items():
-        metrics[name], e = err_stats(xy_hat, xy_true)
-        curves[name] = e.mean(0)
-        print(f"[e5] {name:40s} " + "  ".join(f"{k}={v:.0f}" for k, v in metrics[name].items()))
-    (out / "metrics.json").write_text(json.dumps(
-        {"n_flights": int(len(sel)), "routes": metrics}, indent=2))
+        metrics[name] = entry_drift(xy_hat, xy_true)
+        curves[name] = np.linalg.norm(xy_hat - xy_true, axis=2).mean(0)   # (T,) mean over flights
+        m = metrics[name]
+        print(f"[e5] {name:32s} entry mean {m['entry_mean_m']:5.0f}m  median {m['entry_median_m']:5.0f}m  "
+              f"p90 {m['entry_p90_m']:5.0f}m  path {m['path_mean_m']:5.0f}m")
+    metrics["_n_flights"] = int(len(xy_true))
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
-    hdr = list(next(iter(metrics.values())).keys())
-    lines = ["| route | " + " | ".join(hdr) + " |", "|---|" + "---|" * len(hdr)]
+    # table
+    hdr = ["entry_mean_m", "entry_median_m", "entry_p90_m", "path_mean_m"]
+    lines = ["| route | " + " | ".join(h.replace("_m", " (m)") for h in hdr) + " |",
+             "|---|" + "---|" * len(hdr)]
     for name, m in metrics.items():
-        lines.append(f"| {name} | " + " | ".join(f"{m[k]:.0f}" for k in hdr) + " |")
+        if name.startswith("_"):
+            continue
+        lines.append(f"| {name} | " + " | ".join(f"{m[h]:.0f}" for h in hdr) + " |")
     (out / "table.md").write_text("\n".join(lines) + "\n")
 
-    # --- error growth over time ---
+    # --- error growth (FAF at right ~0, entry at left = max) ---
     fig, ax = plt.subplots(figsize=(9, 5))
-    colors = {"deadreckon gs/track (euler)": "#1f77b4",
-              "deadreckon gs/track (trapezoid)": "#17becf",
-              "derived controls (SavGol21+trapezoid)": "#d62728"}
+    colors = {"gs/track FAF (factor 1.0)": "#1f77b4",
+              "gs/track FAF (factor 0.99, ref)": "#17becf",
+              "derived controls FAF": "#d62728"}
     for name, c in curves.items():
-        ax.plot(c, lw=2, label=name, color=colors.get(name))
-    for h in HORIZONS[:-1]:
-        ax.axvline(h, color="gray", ls=":", lw=1)
-    ax.set_xlabel("timestep")
+        ax.plot(c, lw=2, label=name, color=colors[name])
+    ax.set_xlabel("timestep (0 = entry, 199 = FAF anchor)")
     ax.set_ylabel("mean position error (m)")
-    ax.set_title(f"E5: position error growth — controls integration vs dead-reckoning ({len(sel)} val flights)")
+    ax.set_title(f"E5: FAF-anchored reconstruction error ({len(xy_true)} val flights)")
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "error_growth.png", dpi=130)
     plt.close(fig)
 
-    # --- overlay figure ---
-    # row 1: median + two worst DEAD-RECKONING flights
-    # row 2: the three worst CONTROLS-reconstruction flights (its own failure modes)
-    e_dr = np.hypot(*(routes["deadreckon gs/track (euler)"] - xy_true).transpose(2, 0, 1)).mean(1)
-    e_ct = np.hypot(*(routes["derived controls (SavGol21+trapezoid)"] - xy_true).transpose(2, 0, 1)).mean(1)
-    order_dr, order_ct = np.argsort(e_dr), np.argsort(e_ct)
-    rows = [
-        ("median + two worst dead-reckoning flights",
-         [order_dr[len(order_dr) // 2], order_dr[-2], order_dr[-1]]),
-        ("three worst controls-reconstruction flights",
-         [order_ct[-3], order_ct[-2], order_ct[-1]]),
-    ]
+    # --- overlay: worst for gs/track (top) and worst for controls (bottom) ---
+    e_dr = np.linalg.norm(routes["gs/track FAF (factor 1.0)"][:, 0] - xy_true[:, 0], axis=1)
+    e_ct = np.linalg.norm(routes["derived controls FAF"][:, 0] - xy_true[:, 0], axis=1)
+    rows = [("worst gs/track entry drift", np.argsort(e_dr)[-3:]),
+            ("worst controls entry drift", np.argsort(e_ct)[-3:])]
     fig, axes = plt.subplots(2, 3, figsize=(15, 10.5))
     for r, (row_title, pick) in enumerate(rows):
         for cidx, k in enumerate(pick):
             ax = axes[r, cidx]
-            ax.plot(xy_true[k, :, 0], xy_true[k, :, 1], color="black", lw=2.2, label="real track")
-            ax.plot(*routes["deadreckon gs/track (euler)"][k].T, color="#1f77b4", lw=1.4,
-                    label="dead-reckon gs/track")
-            ax.plot(*routes["derived controls (SavGol21+trapezoid)"][k].T, color="#d62728",
-                    lw=1.4, ls="--", label="controls re-integration")
-            ax.scatter([xy_true[k, 0, 0]], [xy_true[k, 0, 1]], color="green", s=25, zorder=5)
-            ax.set_title(f"flight {k}: DR {e_dr[k]:.0f} m vs controls {e_ct[k]:.0f} m mean",
-                         fontsize=9)
+            ax.plot(xy_true[k, :, 0], xy_true[k, :, 1], color="black", lw=2.2, label="real")
+            ax.plot(*routes["gs/track FAF (factor 1.0)"][k].T, color="#1f77b4", lw=1.3, label="gs/track (FAF)")
+            ax.plot(*routes["derived controls FAF"][k].T, color="#d62728", lw=1.3, ls="--", label="controls (FAF)")
+            ax.scatter(*faf_xy[k], color="green", s=30, zorder=5, label="FAF (anchor)")
+            ax.scatter(*xy_true[k, 0], color="orange", s=30, zorder=5, label="true entry")
+            ax.set_title(f"flight {k}: gs/trk {e_dr[k]:.0f} m vs ctrl {e_ct[k]:.0f} m entry drift", fontsize=9)
             ax.set_aspect("equal", "datalim")
             ax.grid(alpha=0.3)
         axes[r, 0].set_ylabel(row_title, fontsize=10)
-    axes[0, 0].legend(fontsize=8)
-    fig.suptitle("E5: overlay — top: worst for dead-reckoning; bottom: worst for controls")
+    axes[0, 0].legend(fontsize=7)
+    fig.suptitle("E5: FAF-anchored reconstruction — green=FAF anchor, orange=true entry")
     fig.tight_layout()
     fig.savefig(out / "overlay.png", dpi=130)
     plt.close(fig)
