@@ -69,6 +69,19 @@ def main() -> None:
                         shuffle=True, drop_last=True)
     clip, val_every = float(tcfg["grad_clip"]), int(tcfg["val_every"])
 
+    def save_ckpt(path, state, epoch, val):
+        torch.save(
+            {
+                "experiment": dirs["name"], "arch": arch, "dropout": dropout,
+                "features": data["names"], "feature_set": data["feature_set"],
+                "channels": C, "t_len": T, "scaler": data["scaler"].to_dict(),
+                "bounds": data["bounds"], "ddpm_cfg": cfg["ddpm"], "config": cfg,
+                "model_state": state, "epoch": epoch, "val_loss": val, "ema": True,
+            },
+            path,
+        )
+
+    best_val = float("inf")
     t0 = time.time()
     for ep in range(1, epochs + 1):
         lr_now = reference_lr(ep, epochs, tcfg)
@@ -90,13 +103,21 @@ def main() -> None:
             writer.add_scalar("train/loss_epoch", train_loss, ep)
             writer.add_scalar("train/lr", lr_now, ep)
         if ep % val_every == 0 or ep == 1 or ep == epochs:
+            # evaluate the EMA weights (what we sample from), and pick best on them
+            raw_state = {k: v.detach().clone() for k, v in ddpm.state_dict().items()}
+            ema.copy_to(ddpm)
             ddpm.eval()
             with torch.no_grad():
                 vloss = torch.stack([ddpm(X_va[:512]) for _ in range(4)]).mean().item()
+            if vloss < best_val:
+                best_val = vloss
+                save_ckpt(dirs["results"] / "ckpt_best.pt", ema.state_dict(), ep, vloss)
+            ddpm.load_state_dict(raw_state)          # restore raw weights for training
             if writer:
                 writer.add_scalar("val/loss", vloss, ep)
+                writer.add_scalar("val/best_loss", best_val, ep)
             print(f"[{dirs['name']}] epoch {ep:4d}/{epochs} train {train_loss:.4f} "
-                  f"val {vloss:.4f} ({time.time() - t0:.0f}s)")
+                  f"val {vloss:.4f} (best {best_val:.4f}) ({time.time() - t0:.0f}s)")
 
         # in-training sample snapshots (legacy-style 4-panel, scaled units)
         viz_every = int(cfg.get("viz", {}).get("every", 0))
@@ -117,32 +138,18 @@ def main() -> None:
 
             plt.close(fig)
 
-    ema.copy_to(ddpm)
-    ddpm.eval()
-    ckpt = dirs["results"] / "ckpt.pt"
-    torch.save(
-        {
-            "experiment": dirs["name"],
-            "arch": arch,
-            "dropout": dropout,
-            "features": data["names"],
-            "feature_set": data["feature_set"],
-            "channels": C,
-            "t_len": T,
-            "scaler": data["scaler"].to_dict(),
-            "bounds": data["bounds"],
-            "ddpm_cfg": cfg["ddpm"],
-            "model_state": ddpm.state_dict(),
-            "config": cfg,
-        },
-        ckpt,
-    )
+    # final (last) checkpoint = EMA weights at end of training
+    save_ckpt(dirs["results"] / "ckpt_last.pt", ema.state_dict(), epochs, float("nan"))
+    # keep ckpt.pt as an alias of last for backward compat
+    save_ckpt(dirs["results"] / "ckpt.pt", ema.state_dict(), epochs, float("nan"))
     (dirs["results"] / "train_info.json").write_text(json.dumps(
         {"epochs": epochs, "params_M": n_params / 1e6, "arch": arch,
-         "features": data["names"], "wall_s": round(time.time() - t0, 1)}, indent=2))
+         "features": data["names"], "best_val": round(best_val, 5),
+         "wall_s": round(time.time() - t0, 1)}, indent=2))
     if writer:
         writer.close()
-    print(f"[{dirs['name']}] checkpoint -> {ckpt}")
+    print(f"[{dirs['name']}] saved ckpt_best.pt (val {best_val:.4f}) + ckpt_last.pt "
+          f"-> {dirs['results']}")
 
 
 if __name__ == "__main__":

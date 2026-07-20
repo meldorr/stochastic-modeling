@@ -68,6 +68,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Stage 2: generate samples")
     ap.add_argument("--exp", required=True)
     ap.add_argument("--n", type=int, default=None)
+    ap.add_argument("--which", choices=["best", "last"], default="best",
+                    help="checkpoint to sample from (default: best-by-val)")
     args = ap.parse_args()
 
     cfg = load_experiment_config(args.exp)
@@ -76,7 +78,11 @@ def main() -> None:
     dirs = experiment_dirs(cfg)
     n = args.n or int(cfg["generate"]["n_samples"])
 
-    ddpm, ckpt = load_ckpt(dirs["results"] / "ckpt.pt", device)
+    ck = dirs["results"] / f"ckpt_{args.which}.pt"
+    if not ck.exists():
+        ck = dirs["results"] / "ckpt.pt"       # fallback for older runs
+    print(f"[{dirs['name']}] loading {ck.name}")
+    ddpm, ckpt = load_ckpt(ck, device)
     scaler = scaler_from_dict(ckpt["scaler"])
     names, fs = ckpt["features"], ckpt["feature_set"]
     C, T = ckpt["channels"], ckpt["t_len"]
