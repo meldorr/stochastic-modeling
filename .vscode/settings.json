@@ -1,0 +1,19 @@
+{
+  "files.watcherExclude": {
+    "**/results/**": true,
+    "**/runs/**": true,
+    "**/archive/**": true,
+    "**/__pycache__/**": true,
+    "**/*.pt": true,
+    "**/*.npz": true
+  },
+  "search.exclude": {
+    "**/results": true,
+    "**/runs": true,
+    "**/archive": true,
+    "**/__pycache__": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true
+  }
+}

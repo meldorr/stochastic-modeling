@@ -1,51 +1,32 @@
-"""Raw trajectory denoiser registry — the experiment families:
+"""Raw trajectory denoiser registry — the experiment families, all faithful
+ports of diffusion-models-lab:
 
-    fc         plain fully-connected net on the flattened (C*T) trajectory
-    fcn_unet   fully-connected U-Net on the flattened trajectory
-    tcn_unet   reference TCN U-Net (diffusion-models-lab), operates on (B, C, T)
+    fc         constant-width fully-connected denoiser (commit 85b4980)
+    fcn_unet   fully-connected U-Net denoiser (commit 19e9741)
+    tcn_unet   bidirectional TCN U-Net (commit 8846ad0)
 
-``fc``/``fcn_unet`` reuse the latent MLP denoisers behind a flatten adapter, so
-all three expose the same (B, C, T) -> (B, C, T) epsilon interface.
+All three take and return ``(B, C, T)`` and expose the same epsilon interface
+``denoiser(x_t, t)`` with integer timesteps, so they plug straight into
+:class:`~src.ddpm.ddpm.LatentDDPM`.
 """
 
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 
-from .denoiser import MLPDenoiser, UNetMLPDenoiser
+from .fc import FCDenoiser, FCUNetDenoiser
 from .tcn_unet import TCNUNetDenoiser
 
 RAW_ARCHS = ("fc", "fcn_unet", "tcn_unet")
 
 
-class FlattenDenoiser(nn.Module):
-    """Adapter: run a (B, m)-denoiser on flattened (B, C, T) trajectories."""
-
-    def __init__(self, inner: nn.Module, c: int, t_len: int):
-        super().__init__()
-        self.inner = inner
-        self.c = c
-        self.t_len = t_len
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        out = self.inner(x.flatten(1), t)
-        return out.view(-1, self.c, self.t_len)
-
-
-def build_raw_denoiser(arch: str, c: int, t_len: int, dropout: float = 0.0) -> nn.Module:
-    m = c * t_len
+def build_raw_denoiser(arch: str, c: int, t_len: int, dropout: float = 0.0,
+                       base_channels: int = 64) -> nn.Module:
     if arch == "fc":
-        return FlattenDenoiser(
-            MLPDenoiser(m=m, hidden_dim=1024, n_blocks=4, time_dim=128, dropout=dropout),
-            c, t_len,
-        )
+        return FCDenoiser(c=c, t_len=t_len, hidden=1024, time_dim=256, depth=8, dropout=dropout)
     if arch == "fcn_unet":
-        return FlattenDenoiser(
-            UNetMLPDenoiser(m=m, hidden_dim=512, depth=3, channel_mult=(1, 2, 4),
-                            blocks_per_level=2, time_dim=128, dropout=dropout),
-            c, t_len,
-        )
+        return FCUNetDenoiser(c=c, t_len=t_len, time_dim=256,
+                              widths=(2048, 1024, 512, 256, 128), dropout=dropout)
     if arch == "tcn_unet":
-        return TCNUNetDenoiser(c=c, t_len=t_len, dropout=dropout)
+        return TCNUNetDenoiser(c=c, t_len=t_len, base_channels=base_channels, dropout=dropout)
     raise ValueError(f"unknown raw arch {arch!r}; choose from {RAW_ARCHS}")

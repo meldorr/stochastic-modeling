@@ -18,12 +18,13 @@ EPOCHS="${EPOCHS:-}"          # empty = use configs (base.yaml training.epochs)
 N_GEN="${N_GEN:-}"            # empty = use configs (generate.n_samples)
 
 EXPERIMENTS=(
+  ddpm_fc_standardscaler__xy
+  ddpm_fcn_unet_standardscaler__xy
   ddpm_tcn_unet_standardscaler__xy
   ddpm_tcn_unet_standardscaler_dropout__xy
   ddpm_tcn_unet_standardscaler__gstrack
+  ddpm_tcn_unet_standardscaler__gstrack_derived
   ddpm_tcn_unet_standardscaler__controls
-  ddpm_fc_standardscaler__xy
-  ddpm_fcn_unet_standardscaler__xy
 )
 # positional args override the list
 if [ "$#" -gt 0 ]; then EXPERIMENTS=("$@"); fi

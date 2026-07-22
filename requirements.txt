@@ -10,6 +10,7 @@ scikit-learn>=1.7
 pandas>=2.3
 pyarrow>=17
 matplotlib>=3.10
+pyproj>=3.6
 PyYAML>=6.0
 tensorboard>=2.18
 tqdm>=4.66

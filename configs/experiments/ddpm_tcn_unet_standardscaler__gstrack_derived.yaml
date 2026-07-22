@@ -1,0 +1,10 @@
+# TCN U-Net on the DERIVED dynamical channels
+# [heading (rad), groundspeed (m/s), altitude (ft), timedelta (s)].
+# Heading + speed are differentiated from the x/y path and SavGol-smoothed, so they
+# are consistent-by-construction with x/y and grid-referenced -> reconstructed with a
+# self-consistent planar velocity walk from the FAF (see E5: 201 m entry drift vs
+# 289 m for raw ADS-B gs/track).
+features: gstrack_derived
+arch: tcn_unet
+scaler: standard
+dropout: 0.0

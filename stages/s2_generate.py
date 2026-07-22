@@ -3,15 +3,20 @@
     python stages/s2_generate.py --exp configs/experiments/<name>.yaml [--n 1000]
 
 Outputs in results/<experiment>/:
-    generated.npz       feats (n, T, C) raw units [+ tracks_xyz for controls]
+    generated.npz       feats (n, T, C) raw units [+ tracks_xyz for gstrack/controls]
     generated.parquet   tidy per-timestep frame
     profiles.png        real vs generated channel profiles
 
+Samples the best-by-val checkpoint by default (``--which best``).
+
 Feature-set specifics:
-    xy / gstrack  physics repair clips channels to the training envelope
-    controls      sampled control sequences are clipped to the Section-1.4
-                  envelopes, then re-integrated from entry states drawn from
-                  real flights -> absolute x/y/z tracks
+    xy               physics repair clips channels to the envelope; x/y is modelled
+    gstrack          repaired, then FAF-anchored geodesic dead-reckoning (factor 1.0)
+                     -> absolute x/y (tracks_xyz)
+    gstrack_derived  repaired, then self-consistent planar velocity walk from the FAF
+                     x/y -> absolute x/y (tracks_xyz)
+    controls         clipped to the Section-1.4 envelopes, then integrated backward
+                     from a FAF state drawn from real flights -> x/y (tracks_xyz)
 """
 
 from __future__ import annotations
@@ -31,37 +36,24 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.data.controls import integrate_controls
 from src.data.dataset import scaler_from_dict
+from src.data.reckoning import generated_to_xy
 from src.ddpm import LatentDDPM
 from src.ddpm.registry import build_raw_denoiser
 from src.pipeline.reconstruct import physics_repair
 from src.pipeline.utils import experiment_dirs, get_device, load_experiment_config, set_seed
-from stages.common import load_experiment_data
+from stages.common import load_experiment_data, repair_controls
 
 
 def load_ckpt(path, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     denoiser = build_raw_denoiser(ckpt["arch"], ckpt["channels"], ckpt["t_len"],
-                                  dropout=float(ckpt.get("dropout", 0.0)))
+                                  dropout=float(ckpt.get("dropout", 0.0)),
+                                  base_channels=int(ckpt.get("base_channels", 64)))
     ddpm = LatentDDPM(denoiser, ckpt["ddpm_cfg"]).to(device)
     ddpm.load_state_dict(ckpt["model_state"])
     ddpm.eval()
     return ddpm, ckpt
-
-
-def repair_controls(feats: np.ndarray, ccfg: dict) -> np.ndarray:
-    """Clip sampled controls to the Section-1.4 envelopes; monotone timedelta."""
-    out = feats.copy()
-    lim_cd = np.radians(float(ccfg["clip_turn_rate_deg_s"]))
-    lim_a = float(ccfg["clip_accel_ms2"])
-    vz_lo, vz_hi = [float(v) for v in ccfg["clip_vz_ms"]]
-    out[:, :, 0] = np.clip(out[:, :, 0], -lim_cd, lim_cd)
-    out[:, :, 1] = np.clip(out[:, :, 1], -lim_a, lim_a)
-    out[:, :, 2] = np.clip(out[:, :, 2], vz_lo, vz_hi)
-    td = out[:, :, 3] - out[:, :1, 3]
-    out[:, :, 3] = np.maximum.accumulate(td, axis=1)
-    return out
 
 
 def main() -> None:
@@ -99,16 +91,18 @@ def main() -> None:
     feats = scaler.inverse_transform(np.concatenate(chunks).transpose(0, 2, 1))
 
     extra_npz, extra_cols = {}, {}
+    rng = np.random.default_rng(int(cfg["seed"]))
     if fs == "controls":
         feats = repair_controls(feats, cfg["controls"])
-        # entry states resampled from REAL flights (controls carry no absolute pose)
-        rng = np.random.default_rng(int(cfg["seed"]))
-        entry = data["aux"]["entry"][rng.integers(0, len(data["aux"]["entry"]), n)]
-        tracks = integrate_controls(entry, feats)                      # (n, T, 3) x,y,z m
-        extra_npz = {"tracks_xyz": tracks.astype(np.float32), "entry": entry.astype(np.float32)}
-        extra_cols = {"x": tracks[:, :, 0], "y": tracks[:, :, 1], "z_m": tracks[:, :, 2]}
     else:
         feats = physics_repair(feats, ckpt["bounds"], names)
+    if fs in ("gstrack", "gstrack_derived", "controls"):
+        # FAF-anchored reconstruction to absolute x/y (geodesic for gstrack, planar
+        # velocity walk for gstrack_derived, controls integrator for controls); the
+        # FAF is the fixed, known destination.
+        xy = generated_to_xy(feats, fs, names, data["aux"], rng)       # (n, T, 2) m
+        extra_npz = {"tracks_xyz": xy.astype(np.float32)}
+        extra_cols = {"x": xy[:, :, 0], "y": xy[:, :, 1]}
 
     np.savez_compressed(dirs["results"] / "generated.npz",
                         feats=feats.astype(np.float32),

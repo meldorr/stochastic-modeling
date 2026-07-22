@@ -10,9 +10,11 @@ Hypotheses under test (no training involved):
 Design: fit each representation on the train split, encode->decode the val split,
 then measure (a) per-feature raw-unit RMSE, (b) high-frequency retention of
 gs/track, and (c) the *position* error of the resulting path:
-    - DYN reps: dead-reckon (track, gs, dt) forward from the true start point,
-      compare to the true x/y. Control row: dead-reckon with the REAL dynamics
-      (isolates pure integration error from representation error).
+    - DYN reps: geodesic dead-reckon backward from the FAF (the canonical method,
+      factor 1.0 — same as E5, so representation error is not confounded by the
+      grid-convergence artifact of a planar walk), project to x/y, measure drift at
+      the entry. Control row: dead-reckon with the REAL dynamics (pure integration
+      floor, isolates it from representation error).
     - XY reps: decoded x/y vs true x/y directly.
 
 Writes results/e1_smoothing/{metrics.json, table.md, *.png}.
@@ -40,7 +42,7 @@ from experiments.common import (
     raw_rmse_named,
     save_json,
 )
-from src.data.reckoning import deadreckon_from_faf, entry_drift
+from src.data.reckoning import deadreckon_from_faf_geodesic, entry_drift, latlon_to_local_xy
 from src.fpca import FPCA
 from src.pipeline.utils import load_config
 
@@ -58,8 +60,8 @@ def fit_rep(Xs_tr, names, kind, param):
                     basis="discrete")
 
 
-def eval_dyn_rep(rep, d_dyn, xy_true, va):
-    """Reconstruction + dead-reckoned path metrics for a DYN representation."""
+def eval_dyn_rep(rep, d_dyn, xy_true, ll, va):
+    """Reconstruction + geodesic FAF-reckoned path metrics for a DYN representation."""
     names = d_dyn["feature_names"]
     Xs_va = d_dyn["X_std"][va]
     rec_std = rep.decode(rep.encode(Xs_va))
@@ -67,9 +69,10 @@ def eval_dyn_rep(rep, d_dyn, xy_true, va):
     real_raw = d_dyn["X"][va]
 
     ti, gi, tdi = names.index("track"), names.index("groundspeed"), names.index("timedelta")
-    # reverse from the FAF (true last point), measure drift at entry
-    xy_hat = deadreckon_from_faf(rec_raw[:, :, ti], rec_raw[:, :, gi], rec_raw[:, :, tdi],
-                                 xy_true[:, -1, :], gs_factor=1.0)
+    # geodesic reverse from the FAF (true last lat/lon), project to x/y, drift at entry
+    ll_hat = deadreckon_from_faf_geodesic(rec_raw[:, :, ti], rec_raw[:, :, gi], rec_raw[:, :, tdi],
+                                          ll[:, -1, :], gs_factor=1.0)
+    xy_hat = latlon_to_local_xy(ll_hat, ref_latlon=ll, ref_xy=xy_true)
     return {
         "rmse_raw": raw_rmse_named(rec_std, Xs_va, d_dyn["scaler"], names),
         "hf_gs": hf_retention(rec_raw[:, :, gi], real_raw[:, :, gi]),
@@ -96,6 +99,7 @@ def eval_xy_rep(rep, d_xy, va):
 
 def main() -> None:
     cfg = load_config()
+    cfg.setdefault("paths", {}).setdefault("processed", "data/processed.npz")
     out = out_dir(cfg, "e1_smoothing")
 
     d_dyn = load_features(cfg, DYN)
@@ -103,15 +107,17 @@ def main() -> None:
     tr, va = d_dyn["train_idx"], d_dyn["val_idx"]          # identical split for both
     xi, yi = d_xy["feature_names"].index("x"), d_xy["feature_names"].index("y")
     xy_true = d_xy["X"][va][:, :, [xi, yi]].astype(np.float64)
+    ll = np.load(cfg["paths"]["processed"], allow_pickle=True)["latlon"][va]   # (Nval,T,2) FAF anchor source
 
     rows, recons = {}, {}
 
-    # control: FAF-reverse dead-reckon with REAL dynamics (pure integration floor)
+    # control: geodesic FAF-reverse dead-reckon with REAL dynamics (pure integration floor)
     real_raw = d_dyn["X"][va]
     names_d = d_dyn["feature_names"]
     ti, gi, tdi = names_d.index("track"), names_d.index("groundspeed"), names_d.index("timedelta")
-    xy_dr_real = deadreckon_from_faf(real_raw[:, :, ti], real_raw[:, :, gi], real_raw[:, :, tdi],
-                                     xy_true[:, -1, :], gs_factor=1.0)
+    ll_dr_real = deadreckon_from_faf_geodesic(real_raw[:, :, ti], real_raw[:, :, gi], real_raw[:, :, tdi],
+                                              ll[:, -1, :], gs_factor=1.0)
+    xy_dr_real = latlon_to_local_xy(ll_dr_real, ref_latlon=ll, ref_xy=xy_true)
     rows["dyn|real|deadreckon-control"] = {"drift": entry_drift(xy_dr_real, xy_true), "m": None}
 
     # dyn representations
@@ -119,7 +125,7 @@ def main() -> None:
         for p in params:
             rep = fit_rep(d_dyn["X_std"][tr], names_d, kind, p)
             key = f"dyn|{kind}|{p}"
-            rows[key], rec_raw, xy_hat = eval_dyn_rep(rep, d_dyn, xy_true, va)
+            rows[key], rec_raw, xy_hat = eval_dyn_rep(rep, d_dyn, xy_true, ll, va)
             recons[key] = (rec_raw, xy_hat)
             print(f"[e1] {key:24s} m={rows[key]['m']:3d} "
                   f"entry drift={rows[key]['drift']['entry_mean_m']:.0f}m "

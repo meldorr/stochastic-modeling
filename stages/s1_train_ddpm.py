@@ -21,14 +21,23 @@ import time
 import matplotlib
 
 matplotlib.use("Agg")
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.data.augment import se2_augment
+from src.data.reckoning import generated_to_xy
 from src.ddpm import LatentDDPM
 from src.ddpm.ddpm import EMA
 from src.ddpm.registry import build_raw_denoiser
 from src.pipeline.utils import experiment_dirs, get_device, load_experiment_config, set_seed
-from stages.common import load_experiment_data, make_progress_figure, make_writer, reference_lr
+from stages.common import (
+    load_experiment_data,
+    make_progress_figure,
+    make_writer,
+    reference_lr,
+    repair_controls,
+)
 
 
 def main() -> None:
@@ -54,10 +63,24 @@ def main() -> None:
 
     arch = cfg.get("arch", "tcn_unet")
     dropout = float(cfg.get("dropout", 0.0))
-    denoiser = build_raw_denoiser(arch, C, T, dropout=dropout)
+    base_channels = int(cfg.get("base_channels", 64))
+    denoiser = build_raw_denoiser(arch, C, T, dropout=dropout, base_channels=base_channels)
     ddpm = LatentDDPM(denoiser, cfg["ddpm"]).to(device)
     n_params = sum(p.numel() for p in ddpm.parameters())
-    print(f"[{dirs['name']}] arch={arch} dropout={dropout} scaler={cfg.get('scaler', 'standard')} "
+
+    # on-the-fly SE(2) augmentation (rigid -> flyable); applied in normalized space
+    augment = cfg.get("augment")
+    x_idx = data["names"].index("x") if "x" in data["names"] else 0
+    y_idx = data["names"].index("y") if "y" in data["names"] else 1
+
+    def maybe_aug(batch):
+        # returns (batch, mask); mask is None unless free SE(2) padding is on
+        if augment in ("se2", "se2_free"):
+            return se2_augment(batch, x_idx, y_idx, free=(augment == "se2_free"))
+        return batch, None
+
+    print(f"[{dirs['name']}] arch={arch} base_ch={base_channels} dropout={dropout} "
+          f"scaler={cfg.get('scaler', 'standard')} augment={augment} "
           f"features={data['names']} shape=({C},{T}) params={n_params / 1e6:.2f}M device={device}")
 
     tcfg = cfg["training"]
@@ -73,6 +96,7 @@ def main() -> None:
         torch.save(
             {
                 "experiment": dirs["name"], "arch": arch, "dropout": dropout,
+                "base_channels": base_channels, "augment": augment,
                 "features": data["names"], "feature_set": data["feature_set"],
                 "channels": C, "t_len": T, "scaler": data["scaler"].to_dict(),
                 "bounds": data["bounds"], "ddpm_cfg": cfg["ddpm"], "config": cfg,
@@ -90,8 +114,8 @@ def main() -> None:
         ddpm.train()
         running = 0.0
         for (xb,) in loader:
-            xb = xb.to(device)
-            loss = ddpm(xb)
+            xb, mask = maybe_aug(xb.to(device))
+            loss = ddpm(xb, mask)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(ddpm.parameters(), clip)
@@ -108,7 +132,9 @@ def main() -> None:
             ema.copy_to(ddpm)
             ddpm.eval()
             with torch.no_grad():
-                vloss = torch.stack([ddpm(X_va[:512]) for _ in range(4)]).mean().item()
+                # augmented val: same transform distribution as training
+                vb_all = [maybe_aug(X_va[:512]) for _ in range(4)]
+                vloss = torch.stack([ddpm(vb, vm) for vb, vm in vb_all]).mean().item()
             if vloss < best_val:
                 best_val = vloss
                 save_ckpt(dirs["results"] / "ckpt_best.pt", ema.state_dict(), ep, vloss)
@@ -119,7 +145,8 @@ def main() -> None:
             print(f"[{dirs['name']}] epoch {ep:4d}/{epochs} train {train_loss:.4f} "
                   f"val {vloss:.4f} (best {best_val:.4f}) ({time.time() - t0:.0f}s)")
 
-        # in-training sample snapshots (legacy-style 4-panel, scaled units)
+        # in-training sample snapshots: sample, then FAF-reckon back to absolute
+        # x/y so gstrack/controls progress is read as real ground tracks
         viz_every = int(cfg.get("viz", {}).get("every", 0))
         if viz_every and (ep % viz_every == 0 or ep == epochs):
             ddpm.eval()
@@ -128,7 +155,12 @@ def main() -> None:
                 samp = ddpm.sample(n_viz, shape=(C, T), device=device,
                                    clamp=cfg["ddpm"].get("sample_clamp"))
             gen_std = samp.cpu().numpy().transpose(0, 2, 1)
-            fig = make_progress_figure(gen_std, data["names"], ep)
+            feats_raw = data["scaler"].inverse_transform(gen_std)
+            if data["feature_set"] == "controls":
+                feats_raw = repair_controls(feats_raw, cfg["controls"])
+            xy_viz = generated_to_xy(feats_raw, data["feature_set"], data["names"],
+                                     data["aux"], np.random.default_rng(ep))
+            fig = make_progress_figure(gen_std, data["names"], ep, xy=xy_viz)
             viz_dir = dirs["results"] / "viz"
             viz_dir.mkdir(exist_ok=True)
             fig.savefig(viz_dir / f"epoch_{ep:05d}.png", dpi=110)

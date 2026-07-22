@@ -73,17 +73,70 @@ class MinMaxScaler:
         return cls(np.array(d["lo"]), np.array(d["hi"]))
 
 
-def make_scaler(kind: str, X_train: np.ndarray):
-    """standard -> per-feature z-score; minmax -> per-feature [-1, 1]."""
+class IsotropicScaler:
+    """Like :class:`FeatureScaler`, but the spatial ``x``/``y`` channels share a
+    single **isotropic** scale and are centred on the TMA midpoint, while every
+    other channel is z-scored as usual.
+
+    This is what makes SE(2) augmentation valid in normalized space: with one
+    shared scale for x and y, a rotation (and a translation) of the standardized
+    trajectory is a true rigid motion. Anisotropic per-axis scaling would turn a
+    rotation into a shear.
+    """
+
+    def __init__(self, center: np.ndarray, scale: np.ndarray, names: list[str]):
+        self.center = np.asarray(center, np.float64)
+        self.scale = np.asarray(scale, np.float64)
+        self.scale[self.scale == 0] = 1.0
+        self.names = list(names)
+
+    @classmethod
+    def fit(cls, X: np.ndarray, names: list[str]) -> "IsotropicScaler":
+        flat = X.reshape(-1, X.shape[-1])
+        center = flat.mean(0).astype(np.float64)          # z-score defaults (non-spatial)
+        scale = flat.std(0).astype(np.float64)
+        if "x" in names and "y" in names:
+            xi, yi = names.index("x"), names.index("y")
+            center[xi] = 0.5 * (flat[:, xi].min() + flat[:, xi].max())
+            center[yi] = 0.5 * (flat[:, yi].min() + flat[:, yi].max())
+            iso = max(0.5 * (flat[:, xi].max() - flat[:, xi].min()),
+                      0.5 * (flat[:, yi].max() - flat[:, yi].min()))
+            scale[xi] = scale[yi] = iso                    # shared isotropic scale
+        return cls(center, scale, names)
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return ((X - self.center) / self.scale).astype(np.float32)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return (X * self.scale + self.center).astype(np.float32)
+
+    def to_dict(self) -> dict:
+        return {"kind": "isotropic", "center": self.center.tolist(),
+                "scale": self.scale.tolist(), "names": self.names}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IsotropicScaler":
+        return cls(np.array(d["center"]), np.array(d["scale"]), d.get("names", []))
+
+
+def make_scaler(kind: str, X_train: np.ndarray, names: list[str] | None = None):
+    """standard -> per-feature z-score; minmax -> [-1,1]; isotropic -> shared x/y scale."""
     if kind == "standard":
         return FeatureScaler.fit(X_train)
     if kind == "minmax":
         return MinMaxScaler.fit(X_train)
-    raise ValueError(f"unknown scaler {kind!r} (standard | minmax)")
+    if kind == "isotropic":
+        return IsotropicScaler.fit(X_train, names or [])
+    raise ValueError(f"unknown scaler {kind!r} (standard | minmax | isotropic)")
 
 
 def scaler_from_dict(d: dict):
-    return MinMaxScaler.from_dict(d) if d.get("kind") == "minmax" else FeatureScaler.from_dict(d)
+    kind = d.get("kind")
+    if kind == "minmax":
+        return MinMaxScaler.from_dict(d)
+    if kind == "isotropic":
+        return IsotropicScaler.from_dict(d)
+    return FeatureScaler.from_dict(d)
 
 
 def split_indices(n: int, train_ratio: float, seed: int) -> tuple[np.ndarray, np.ndarray]:

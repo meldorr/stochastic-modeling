@@ -1,10 +1,13 @@
 """Shared helpers for the staged DDPM experiments.
 
 Feature sets an experiment can select (``features:`` in its yaml):
-    xy        [x, y, altitude, timedelta]
-    gstrack   [track, groundspeed, altitude, timedelta]
-    controls  [turn_rate, along_accel, vert_rate, timedelta]  (derived, Section 1.4)
-              + per-flight entry states (x0, y0, z0, gs0, chi0) for re-integration
+    xy               [x, y, altitude, timedelta]
+    gstrack          [track, groundspeed, altitude, timedelta]  (raw ADS-B)
+    gstrack_derived  [heading, groundspeed_ms, altitude, timedelta]  (heading+speed
+                     derived & SavGol-smoothed from the x/y path; grid-referenced,
+                     so it reconstructs with a self-consistent planar walk)
+    controls         [turn_rate, along_accel, vert_rate, timedelta]  (derived, Sec 1.4)
+                     + per-flight entry states (x0, y0, z0, gs0, chi0) for re-integration
 """
 
 from __future__ import annotations
@@ -23,7 +26,9 @@ from src.pipeline.utils import resolve
 
 FEATURE_SETS = {
     "xy": ["x", "y", "altitude", "timedelta"],
+    "xyt": ["x", "y", "timedelta"],                 # SE(2)-augmentable: x/y + time only
     "gstrack": ["track", "groundspeed", "altitude", "timedelta"],
+    "gstrack_derived": ["heading", "groundspeed_ms", "altitude", "timedelta"],
     "controls": CONTROL_NAMES,
 }
 
@@ -41,22 +46,35 @@ def load_experiment_data(cfg: dict) -> dict:
     stored = [str(f) for f in d["meta"]["feature_names"]]
     col = {n: d["X"][:, :, stored.index(n)].astype(np.float64) for n in stored}
 
-    aux: dict = {"real_xy": np.stack([col["x"], col["y"]], axis=-1)}
+    # FAF anchors for the fixed reckoning at generation time (the FAF is the known
+    # destination): lat/lon for the geodesic gstrack walk, x/y to calibrate the
+    # lat/lon->UTM offset, full state for the controls integrator.
+    faf_latlon = d["anchor_last"].astype(np.float64)                       # (N, 2) lat/lon
+    faf_xy = np.stack([col["x"][:, -1], col["y"][:, -1]], axis=-1)          # (N, 2) x/y
+    aux: dict = {"real_xy": np.stack([col["x"], col["y"]], axis=-1),
+                 "faf_latlon": faf_latlon, "faf_xy": faf_xy}
     flow = d["flow"]
-    if fs == "controls":
+    if fs in ("controls", "gstrack_derived"):
+        # both are derived from the x/y path; drop the same gap-interpolation artifacts
         der = derive_controls(col["x"], col["y"], col["altitude"], col["timedelta"], cfg["controls"])
-        ok = der["valid_mask"]                # drop gap-interpolation artifact flights
-        print(f"[data] controls: excluding {int((~ok).sum())}/{len(ok)} artifact flights "
+        ok = der["valid_mask"]
+        print(f"[data] {fs}: excluding {int((~ok).sum())}/{len(ok)} artifact flights "
               f"({100 * (~ok).mean():.1f}%)")
-        X = der["controls"][ok].astype(np.float32)
-        aux.update(entry=der["entry"][ok], clip_rates=der["clip_rates"])
+        if fs == "controls":
+            X = der["controls"][ok].astype(np.float32)
+            aux.update(entry=der["entry"][ok], faf_state=der["faf"][ok], clip_rates=der["clip_rates"])
+        else:  # gstrack_derived: [heading (rad), groundspeed (m/s), altitude (ft), timedelta (s)]
+            X = np.stack([der["chi"], der["gs"], col["altitude"], col["timedelta"]],
+                         axis=-1)[ok].astype(np.float32)
         aux["real_xy"] = aux["real_xy"][ok]
+        aux["faf_latlon"] = aux["faf_latlon"][ok]
+        aux["faf_xy"] = aux["faf_xy"][ok]
         flow = flow[ok]
     else:
         X = np.stack([col[n] for n in names], axis=-1).astype(np.float32)
 
     tr, va = split_indices(len(X), float(cfg["data"]["train_ratio"]), int(cfg["seed"]))
-    scaler = make_scaler(cfg.get("scaler", "standard"), X[tr])
+    scaler = make_scaler(cfg.get("scaler", "standard"), X[tr], names)
     flat = X[tr].reshape(-1, X.shape[-1])
     bounds = np.stack([flat.min(0), flat.max(0)], axis=1).astype(np.float32)
 
@@ -65,6 +83,20 @@ def load_experiment_data(cfg: dict) -> dict:
         "scaler": scaler, "bounds": bounds, "train_idx": tr, "val_idx": va,
         "aux": aux, "flow": flow,
     }
+
+
+def repair_controls(feats: np.ndarray, ccfg: dict) -> np.ndarray:
+    """Clip sampled controls to the Section-1.4 envelopes; make timedelta monotone."""
+    out = feats.copy()
+    lim_cd = np.radians(float(ccfg["clip_turn_rate_deg_s"]))
+    lim_a = float(ccfg["clip_accel_ms2"])
+    vz_lo, vz_hi = [float(v) for v in ccfg["clip_vz_ms"]]
+    out[:, :, 0] = np.clip(out[:, :, 0], -lim_cd, lim_cd)
+    out[:, :, 1] = np.clip(out[:, :, 1], -lim_a, lim_a)
+    out[:, :, 2] = np.clip(out[:, :, 2], vz_lo, vz_hi)
+    td = out[:, :, 3] - out[:, :1, 3]
+    out[:, :, 3] = np.maximum.accumulate(td, axis=1)
+    return out
 
 
 def reference_lr(epoch: int, total: int, tcfg: dict) -> float:
@@ -77,9 +109,14 @@ def reference_lr(epoch: int, total: int, tcfg: dict) -> float:
     return lr_peak + (lr_end - lr_peak) * u
 
 
-def make_progress_figure(gen_std: np.ndarray, names: list[str], epoch: int):
+def make_progress_figure(gen_std: np.ndarray, names: list[str], epoch: int, xy: np.ndarray | None = None):
     """4-panel in-training diagnostic (scaled units), matching the legacy runs:
-    ch0-ch1 trajectories | timedelta vs t | altitude vs t | mean±std per channel."""
+    top-left trajectories | timedelta vs t | altitude vs t | mean±std per channel.
+
+    If ``xy`` (n, T, 2) is given it is the FAF-reckoned absolute x/y for these
+    samples (km); the top-left panel shows that instead of scaled ch0/ch1, so
+    gstrack/controls snapshots are read as real ground tracks, not raw channels.
+    """
     import matplotlib.pyplot as plt
 
     n, T, C = gen_std.shape
@@ -89,11 +126,18 @@ def make_progress_figure(gen_std: np.ndarray, names: list[str], epoch: int):
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
 
     ax = axes[0, 0]
-    for i in range(n):
-        ax.plot(gen_std[i, :, 0], gen_std[i, :, 1], lw=0.9, alpha=0.7)
-    ax.set_xlabel(f"{names[0]} (scaled)")
-    ax.set_ylabel(f"{names[1]} (scaled)")
-    ax.set_title(f"Epoch {epoch} — Generated {names[0]}–{names[1]} (scaled) — {n}/{n}")
+    if xy is not None:
+        for i in range(n):
+            ax.plot(xy[i, :, 0] / 1000.0, xy[i, :, 1] / 1000.0, lw=0.9, alpha=0.7)
+        ax.set_xlabel("x (km)")
+        ax.set_ylabel("y (km)")
+        ax.set_title(f"Epoch {epoch} — Generated ground track (FAF-reckoned) — {n}/{n}")
+    else:
+        for i in range(n):
+            ax.plot(gen_std[i, :, 0], gen_std[i, :, 1], lw=0.9, alpha=0.7)
+        ax.set_xlabel(f"{names[0]} (scaled)")
+        ax.set_ylabel(f"{names[1]} (scaled)")
+        ax.set_title(f"Epoch {epoch} — Generated {names[0]}–{names[1]} (scaled) — {n}/{n}")
     ax.set_aspect("equal", "datalim")
 
     for ax, j, ttl in ((axes[0, 1], tdi, "timedelta vs time"), (axes[1, 0], ai, f"{names[ai]} vs time")):

@@ -1,0 +1,17 @@
+# SE(2)-augmented TCN U-Net on [x, y, timedelta].
+#
+# Each flight is rigidly transformed on-the-fly before noising (rotate about its
+# centroid + translate within the in-TMA allowable box), turning the fixed 14k
+# approaches into a continuous "any flyable shape, any orientation, anywhere in the
+# TMA" distribution. That enormously enlarges the effective dataset, so we use a
+# bigger network (base_channels 96 -> ~40M params) and many more epochs. Isotropic
+# x/y scaling makes rotation/translation valid rigid motions in normalized space.
+# No altitude, no dynamics — both are recoverable from x/y/time afterwards.
+features: xyt
+arch: tcn_unet
+scaler: isotropic
+augment: se2
+base_channels: 96
+dropout: 0.0
+training:
+  epochs: 20000
