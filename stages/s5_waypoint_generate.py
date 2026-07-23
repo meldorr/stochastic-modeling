@@ -41,7 +41,7 @@ from src.pipeline.utils import get_device, load_config
 
 def load_ckpt(path, device):
     ck = torch.load(path, map_location=device, weights_only=False)
-    den = build_raw_denoiser(ck["arch"], ck["channels"], ck["t_len"], dropout=float(ck.get("dropout", 0.0)))
+    den = build_raw_denoiser(ck["arch"], ck["channels"], ck["t_len"], dropout=float(ck.get("dropout", 0.0)), base_channels=int(ck.get("base_channels", 64)))
     ddpm = LatentDDPM(den, ck["ddpm_cfg"]).to(device)
     ddpm.load_state_dict(ck["model_state"]); ddpm.eval()
     return ddpm, ck
