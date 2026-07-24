@@ -35,20 +35,12 @@ class LatentDDPM(nn.Module):
         s2 = self._gather(self.sqrt_one_minus_alphas_bar, t, x0)
         return s1 * x0 + s2 * noise, noise
 
-    def forward(self, x0: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """DDPM training loss: MSE between predicted and true noise.
-
-        ``mask`` (B, T), from SE(2) free-augmentation, restricts the loss to valid
-        (in-TMA) timesteps — zero-padded out-of-box points contribute no gradient.
-        """
+    def forward(self, x0: torch.Tensor) -> torch.Tensor:
+        """DDPM training loss: MSE between predicted and true noise."""
         b = x0.shape[0]
         t = torch.randint(0, self.timesteps, (b,), device=x0.device, dtype=torch.long)
         x_t, noise = self.q_sample(x0, t)
-        pred = self.denoiser(x_t, t)
-        if mask is None:
-            return F.mse_loss(pred, noise)
-        m = mask.unsqueeze(1)                                    # (B,1,T) broadcast over channels
-        return ((pred - noise) ** 2 * m).sum() / (m.sum() * pred.shape[1] + 1e-8)
+        return F.mse_loss(self.denoiser(x_t, t), noise)
 
     @torch.no_grad()
     def p_sample(self, x_t, t, deterministic: bool = False):
@@ -180,6 +172,85 @@ class LatentDDPM(nn.Module):
                 if clamp is not None:
                     x = x.clamp(-clamp, clamp)
         return x.detach()
+
+
+    def sample_composed(self, n: int, shape: tuple,
+                        tube: tuple | None = None,
+                        entry: tuple | None = None,
+                        classifiers: list | None = None,
+                        known: torch.Tensor | None = None,
+                        kmask: torch.Tensor | None = None,
+                        device=None, clamp: float | None = None):
+        """Product-of-experts sampling: several guidance terms summed each step.
+
+        The composed score is ``∇log p(x) + Σ_i s_i ∇log p_i(y_i | x)`` — location
+        terms and behavior classifiers are just experts whose gradients add:
+
+        - ``tube=(path_pts (P,2), x_idx, y_idx, width, scale)`` — corridor hinge on
+          the clean estimate x0_hat (zero gradient inside the tube; pacing free).
+        - ``entry=(k, target_xy (2,), x_idx, y_idx, scale)`` — first k points
+          attracted to a location (corridor entry).
+        - ``classifiers=[(model, class_idx, scale), ...]`` — noise-conditioned
+          p(class | x_t, t); **positive scale steers into the class, negative away**
+          (e.g. anti-loop). Evaluated on x_t directly.
+        - ``known``/``kmask`` ``(C, T)`` — RePaint hard pin (strict FAF). ``kmask``
+          may be fractional for a feathered (gradual) seam.
+
+        All gradients are applied variance-annealed (``mean - Σ_t * total_grad``);
+        one autograd pass covers every term.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        shape = tuple(shape)
+        if known is not None:
+            known = known.to(device).float().unsqueeze(0).expand(n, *shape)
+            kmask = kmask.to(device).float().unsqueeze(0).expand(n, *shape)
+        if tube is not None:
+            t_path, t_xi, t_yi, t_w, t_s = tube
+            t_path = t_path.to(device).float()
+        x = torch.randn(n, *shape, device=device)
+        for ti in reversed(range(self.timesteps)):
+            t = torch.full((n,), ti, device=device, dtype=torch.long)
+            x = x.detach().requires_grad_(True)
+            eps = self.denoiser(x, t)
+            abar_t = self._gather(self.alphas_bar, t, x)
+            x0_hat = (x - torch.sqrt(1.0 - abar_t) * eps) / torch.sqrt(abar_t)
+
+            total = x.new_zeros(())                                  # scalar loss to differentiate
+            if tube is not None:
+                xy = torch.stack([x0_hat[:, t_xi], x0_hat[:, t_yi]], dim=-1)
+                d2 = ((xy[:, :, None, :] - t_path[None, None]) ** 2).sum(-1)
+                dmin = torch.sqrt(d2.min(dim=2).values + 1e-12)
+                total = total + t_s * F.relu(dmin - t_w).pow(2).mean(1).sum()
+            if entry is not None:
+                e_k, e_xy, e_xi, e_yi, e_s = entry
+                exy = torch.stack([x0_hat[:, e_xi, :e_k], x0_hat[:, e_yi, :e_k]], dim=-1)
+                total = total + e_s * ((exy - e_xy.to(device)) ** 2).sum(-1).mean(1).sum()
+            for clf, cls_idx, c_s in (classifiers or []):
+                logp = F.log_softmax(clf(x, t), dim=1)[:, cls_idx]
+                total = total - c_s * logp.sum()                     # −s·logp: s>0 pulls in, s<0 pushes out
+            grad, = torch.autograd.grad(total, x)
+
+            with torch.no_grad():
+                betas_t = self._gather(self.betas, t, x)
+                alphas_t = self._gather(self.alphas, t, x)
+                mean = (1.0 / torch.sqrt(alphas_t + 1e-8)) * (
+                    x - betas_t / (torch.sqrt(1.0 - abar_t) + 1e-8) * eps
+                )
+                var = self._gather(self.posterior_variance, t, x)
+                mean = mean - var * grad                             # scales live inside the terms
+                x = mean + torch.sqrt(var) * torch.randn_like(x) if ti > 0 else mean
+                if known is not None:
+                    if ti - 1 >= 0:
+                        t_prev = torch.full((n,), ti - 1, device=device, dtype=torch.long)
+                        known_part, _ = self.q_sample(known, t_prev)
+                    else:
+                        known_part = known
+                    x = kmask * known_part + (1.0 - kmask) * x       # fractional kmask = feathered seam
+                if clamp is not None:
+                    x = x.clamp(-clamp, clamp)
+        return x.detach()
+
 
 
 class EMA:
